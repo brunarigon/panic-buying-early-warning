@@ -6,5 +6,4 @@ Regions included in the study:
 https://www.google.com/maps/d/u/1/edit?mid=1eAJI8-ZOgU5zOIyShVemABdIT0Nm-Tg&usp=sharing
 
 
-testing
-<iframe src="https://www.google.com/maps/d/u/1/embed?mid=1eAJI8-ZOgU5zOIyShVemABdIT0Nm-Tg&ehbc=2E312F&noprof=1" width="640" height="480"></iframe>
+Live link: "https://www.google.com/maps/d/u/1/embed?mid=1eAJI8-ZOgU5zOIyShVemABdIT0Nm-Tg&ehbc=2E312F&noprof=1"
