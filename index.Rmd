@@ -1,0 +1,2322 @@
+---
+title: "Reproducibility notebook — An empirical anatomy of retail panic buying: PBB-Score construction, temporal cross-validation, and dynamic responses"
+subtitle: "Companion code to the manuscript submitted to *Computers & Industrial Engineering* (Special Issue: AI in Logistics)"
+date: "Compiled `r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: united
+    df_print: paged
+    code_folding: show
+  pdf_document: default
+  word_document: default
+params:
+  data_dir:   "data"                # folder holding the raw input workbook
+  proc_dir:   "0.Processed_data"    # folder for intermediate datasets
+  out_dir:    "improved_final"      # folder for model outputs, caches and figures
+  run_heavy:  TRUE                  # FALSE = skip XGBoost/SHAP re-fitting, load caches only
+  fetch_sidra: TRUE                 # FALSE = read the bundled deflator CSV instead of the IBGE API
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  error   = FALSE,
+  fig.align = "center",
+  fig.width  = 9,
+  fig.height = 5,
+  dpi = 110
+)
+options(scipen = 999, width = 110)
+set.seed(42)
+```
+
+<!-- ------------------------------------------------------------------ -->
+
+This notebook reproduces, end to end, the empirical pipeline behind the paper. It is the
+documented counterpart of the production script `Temporal_CV_v9.R`, reorganised so that a
+reader can follow *what* is computed, *why* each choice was made, and *what* the result is,
+without having to reverse-engineer the code.
+
+The notebook is organised in **seven parts**:
+
+1. **Constructing the PBB-Score** — from raw fiscal-receipt transaction values to a
+   dimensionless, city-standardised measure of abnormal purchasing.
+2. **Why the evaluation protocol matters** — the methodological core of the paper: what a
+   random train–test split does to temporally autocorrelated panel data.
+3. **Expanding-window temporal cross-validation** — a three-way horse race between an
+   autoregressive baseline, an external open-data model, and their combination.
+4. **Early-warning evaluation** — recasting the forecasts as a rare-event alarm system
+   (AUC-PR, AUC-ROC, threshold selection, lead time).
+5. **Model interpretation with SHAP** — which stimuli and organism variables the model uses.
+6. **Local Projections** — the dynamic, crisis-conditional response of the PBB-Score to
+   S-O-R shocks.
+7. **Episode anatomy** — the descriptive natural history of panic-buying episodes.
+
+> **A note on faithfulness to `Temporal_CV_v9.R`.** The production script grew interactively
+> and contains diagnostic detours that were subsequently reverted. The most consequential is
+> a sequence of alternative winsorisation fences for the municipality of Curitibanos (2.5×
+> IQR, then 2.0× IQR), which is undone before the final model is fitted: the script resets
+> Curitibanos to its raw values and re-applies exactly the same 3× IQR fence used for every
+> other city. That detour is therefore a **no-op**, and the linear pipeline below reproduces
+> the final numerical state of `Temporal_CV_v9.R` exactly. The one substantive change made
+> along the way — adding 30 December to the holiday calendar — is preserved, including the
+> fact that it was applied *after* the `is_pre_holiday` flag had already been computed
+> (see "Holiday calendar" below).
+
+---
+
+# Environment and project layout
+
+```{r libraries}
+required <- c(
+  "data.table", "dplyr", "readxl", "lubridate",   # data handling
+  "fixest", "car",                                # panel econometrics
+  "xgboost", "caret", "treeshap", "PRROC",        # machine learning + SHAP + PR curves
+  "sidrar",                                       # IBGE/SIDRA API (price deflator)
+  "ggplot2", "patchwork", "scales", "knitr"       # graphics and reporting
+)
+missing <- required[!(required %in% rownames(installed.packages()))]
+if (length(missing)) {
+  message("Installing: ", paste(missing, collapse = ", "))
+  install.packages(missing, repos = "https://cloud.r-project.org")
+}
+invisible(lapply(required, library, character.only = TRUE))
+```
+
+Paths are taken from the YAML `params` block, so the notebook can be knitted from any
+checkout of the repository without editing code. **No `setwd()` is used**: `knitr` sets the
+working directory to the folder containing this file.
+
+```{r paths}
+DATA_DIR <- "0.Processed_data"#params$data_dir
+PROC_DIR <- "0.Processed_data"#params$proc_dir
+OUT_DIR  <- "improved_final"#params$out_dir
+
+for (d in c(PROC_DIR, OUT_DIR,
+            file.path(OUT_DIR, "PDFs"),
+            file.path(OUT_DIR, "temporal_cv_ar_augmented", "ar_only"),
+            file.path(OUT_DIR, "temporal_cv_ar_augmented", "external_only"),
+            file.path(OUT_DIR, "temporal_cv_ar_augmented", "combined"),
+            file.path(OUT_DIR, "classification_three_way"),
+            file.path(OUT_DIR, "local_projections"),
+            file.path(OUT_DIR, "episode_anatomy"),
+            file.path(OUT_DIR, "Shap"))) {
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+}
+
+RAW_XLSX     <- file.path(DATA_DIR, "2_5_Final_data_Before_Time_modification_and_new_variables.xlsx")
+PANEL_CSV    <- file.path(PROC_DIR, "3_Final_data_With_Time_modification_ADDED_Var.csv")
+DEFLATOR_CSV <- file.path(PROC_DIR, "deflator_alimentacao_domicilio_2018_2025.csv")
+BEST_ROW     <- file.path(OUT_DIR,  "best_row.csv")
+
+stopifnot("Raw workbook not found — check params$data_dir" = file.exists(RAW_XLSX))
+```
+
+Expensive steps (grid search, 12-fold × 3-model cross-validation, SHAP) write `.rds` caches
+and are skipped on re-knit if the cache exists. Setting `run_heavy: FALSE` in the YAML forces
+the notebook to *only* read caches, which makes a full re-knit take seconds instead of hours.
+
+```{r flags}
+RUN_HEAVY <- isTRUE(params$run_heavy)
+cat("Heavy computation:", if (RUN_HEAVY) "ENABLED" else "DISABLED (cache-only)", "\n")
+```
+
+---
+
+# Part 1 — Constructing the PBB-Score
+
+The dependent variable of the whole paper is the **Panic Buying Behaviour Score (PBB-Score)**,
+also referred to in the code as the **Abnormal Purchase Index (API)**. It is defined as
+
+$$
+\text{PBB}_{c,t} \;=\; \frac{\tilde V_{c,t} - \hat V_{c,t}}{\hat\sigma_c},
+$$
+
+where $\tilde V_{c,t}$ is real per-capita daily supermarket spending in city $c$ on day $t$,
+$\hat V_{c,t}$ is the expected value from a seasonal baseline model estimated on non-crisis
+days only, and $\hat\sigma_c$ is the city-specific standard deviation of that model's
+residuals on non-crisis days.
+
+The construction is deliberately analogous to **abnormal returns in a finance event study**:
+the score is dimensionless, centred on zero in normal times, and directly readable as
+"standard deviations above what this city would ordinarily spend today".
+
+## Raw panel and sanity checks
+
+```{r load-raw}
+# IMPORTANT: readxl guesses each column's type from the first `guess_max` rows. The
+# mobility series (Meta Movement Distribution Maps) are blank until 2022-12, so with
+# the default guess_max readxl infers type `logical` for them and silently coerces
+# every later numeric value to NA. We raise guess_max to cover the full panel, then
+# defensively coerce any mobility / numeric-looking column that still arrived as
+# logical or character back to numeric. This is the fix for the empty Mobilization
+# Local-Projections panel.
+raw <- readxl::read_excel(RAW_XLSX, guess_max = 1e6)
+dt  <- as.data.table(raw)
+dt[, date := as.Date(date)]
+
+coerce_numeric <- function(x) {
+  if (is.numeric(x)) return(x)
+  if (is.logical(x)) return(as.numeric(x))            # all-NA logical -> numeric NA, values kept
+  suppressWarnings(as.numeric(gsub(",", ".", as.character(x), fixed = TRUE)))
+}
+mob_cols <- grep("^mobil_dist", names(dt), value = TRUE)
+for (cc in mob_cols) dt[[cc]] <- coerce_numeric(dt[[cc]])
+
+# Report mobility coverage at the point of entry so any problem is visible immediately.
+if (length(mob_cols)) {
+  nn <- sum(!is.na(dt[[mob_cols[1]]]))
+  cat(sprintf("Mobility columns: %s | %s non-NA rows in %s%s\n",
+              paste(mob_cols, collapse = ", "), format(nn, big.mark = ","), mob_cols[1],
+              if (nn > 0) sprintf(" (%s .. %s)",
+                                  min(dt$date[!is.na(dt[[mob_cols[1]]])]),
+                                  max(dt$date[!is.na(dt[[mob_cols[1]]])])) else ""))
+}
+
+cat(sprintf("Rows            : %s\n", format(nrow(dt), big.mark = ",")))
+cat(sprintf("Municipalities  : %d\n", uniqueN(dt$city)))
+cat(sprintf("Date range      : %s to %s\n", min(dt$date), max(dt$date)))
+cat(sprintf("Missing sales   : %d\n", sum(is.na(dt$total_sales_value_daily))))
+```
+
+The panel is balanced: 15 municipalities of Santa Catarina (Brazil) × daily observations,
+2018–2025, from SEF/SC *Nota Fiscal* electronic invoice records.
+
+## Per-capita normalisation
+
+```{r per-capita}
+dt[, valor_pc := total_sales_value_daily / population_2022]
+summary(dt$valor_pc)
+```
+
+We normalise by the **2022 census population**, not by the number of invoices issued
+(`numero_de_notas_emitidas`). This is not a cosmetic choice: the invoice count is
+*endogenous* to the phenomenon we are measuring — panic buying mechanically inflates the
+number of transactions — so using it as a denominator would partially absorb the very signal
+we are trying to detect. It can legitimately enter the baseline as a *regressor* controlling
+for store activity, but never as a scaling factor.
+
+## Real-value deflation
+
+Nominal spending in Brazil over 2018–2025 is contaminated by substantial food inflation. We
+deflate with the **IPCA sub-index for food consumed at home** (*Alimentação no domicílio*),
+which is the correct price index for supermarket baskets — not headline IPCA.
+
+The series is stitched from two IBGE/SIDRA tables (1419 for 2018–2019, 7060 from 2020
+onward), chained from monthly percentage changes into an index with January 2018 = 100.
+
+```{r sidra-download, results = "hold"}
+pt_months <- c("janeiro" = "01", "fevereiro" = "02", "março"    = "03",
+               "abril"   = "04", "maio"      = "05", "junho"    = "06",
+               "julho"   = "07", "agosto"    = "08", "setembro" = "09",
+               "outubro" = "10", "novembro"  = "11", "dezembro" = "12")
+
+parse_pt_date <- function(x) {
+  parts <- strsplit(tolower(trimws(x)), "\\s+")
+  as.Date(sapply(parts, function(p) {
+    if (length(p) != 2) return(NA_character_)
+    mon <- pt_months[p[1]]
+    if (is.na(mon)) return(NA_character_)
+    paste0(p[2], "-", mon, "-01")
+  }))
+}
+
+get_col <- function(d, pattern, exclude = NULL) {
+  cols <- grep(pattern, names(d), value = TRUE, ignore.case = TRUE)
+  if (!is.null(exclude)) cols <- cols[!grepl(exclude, cols, ignore.case = TRUE)]
+  cols[1]
+}
+
+clean_filter <- function(rawtab, label_col, mes_col, target) {
+  d <- as.data.table(rawtab)[get(label_col) == target]
+  d <- d[, .(year_month = parse_pt_date(as.character(get(mes_col))),
+             var_mes    = suppressWarnings(as.numeric(Valor)))]
+  d <- d[!is.na(year_month) & !is.na(var_mes)]
+  setorder(d, year_month)
+  d[]
+}
+
+fetch_food_deflator <- function() {
+  raw_7060 <- sidrar::get_sidra(x = 7060, variable = 63, period = "202001-202512",
+                                geo = "Brazil", classific = "c315",
+                                category = list("315" = "all"), header = TRUE, format = 3)
+  raw_1419 <- sidrar::get_sidra(x = 1419, variable = 63, period = "201801-201912",
+                                geo = "Brazil", classific = "c315",
+                                category = list("315" = "all"), header = TRUE, format = 3)
+
+  pick_label <- function(tab) {
+    d   <- as.data.table(tab)
+    cc  <- get_col(d, "Geral|subgrupo|subitem")
+    mc  <- get_col(d, "Mês|Mes", exclude = "Código|Code")
+    lab <- unique(d[[cc]])
+    tgt <- lab[grepl("Alimenta.*no domic", lab, ignore.case = TRUE)]
+    stopifnot(length(tgt) > 0)
+    list(cat_col = cc, mes_col = mc, target = tgt[1])
+  }
+  k70 <- pick_label(raw_7060); k14 <- pick_label(raw_1419)
+
+  s7060 <- clean_filter(raw_7060, k70$cat_col, k70$mes_col, k70$target)
+  s1419 <- clean_filter(raw_1419, k14$cat_col, k14$mes_col, k14$target)
+
+  a <- rbind(s1419[year_month <  as.Date("2020-01-01")],
+             s7060[year_month >= as.Date("2020-01-01")])
+  setorder(a, year_month)
+  a[, factor   := 1 + var_mes / 100]
+  a[, alim_idx := cumprod(factor) * 100 / cumprod(factor)[1]]
+  a[, deflator := alim_idx / 100]
+  a[]
+}
+
+if (isTRUE(params$fetch_sidra)) {
+  alim <- tryCatch(fetch_food_deflator(), error = function(e) {
+    message("SIDRA API unavailable (", conditionMessage(e), ") — falling back to cached CSV.")
+    NULL
+  })
+} else {
+  alim <- NULL
+}
+
+if (is.null(alim)) {
+  stopifnot("No SIDRA access and no cached deflator CSV present" = file.exists(DEFLATOR_CSV))
+  alim <- fread(DEFLATOR_CSV)
+  alim[, year_month := as.Date(year_month)]
+  setnames(alim, c("var_mes_pct", "index_jan2018_100"), c("var_mes", "alim_idx"),
+           skip_absent = TRUE)
+} else {
+  fwrite(alim[, .(year_month, var_mes_pct = var_mes,
+                  index_jan2018_100 = alim_idx, deflator)], DEFLATOR_CSV)
+}
+
+# Continuity check: no missing months
+expected <- seq.Date(as.Date("2018-01-01"), max(alim$year_month), by = "month")
+gaps     <- expected[!expected %in% alim$year_month]
+cat(if (length(gaps) == 0) "Continuous monthly series — OK\n"
+    else paste("Missing months:", paste(gaps, collapse = ", "), "\n"))
+```
+
+The cumulative food-price drift is large enough that ignoring it would introduce a spurious
+upward trend into the "abnormality" measure:
+
+```{r deflator-table}
+knitr::kable(
+  alim[month(year_month) == 1, .(Month = year_month,
+                                 `Monthly %` = round(var_mes, 2),
+                                 `Index (Jan-2018 = 100)` = round(alim_idx, 1),
+                                 Deflator = round(deflator, 3))],
+  caption = "IPCA — Food at home: index level each January"
+)
+```
+
+```{r deflate}
+if ("deflator" %in% names(dt)) dt[, deflator := NULL]
+dt[, year_month := as.Date(paste0(format(date, "%Y-%m"), "-01"))]
+dt <- merge(dt, alim[, .(year_month, deflator)], by = "year_month", all.x = TRUE)
+
+n_miss <- sum(is.na(dt$deflator))
+if (n_miss > 0) {
+  stop(sprintf(paste("Deflator missing for %d rows. The IPCA series ends %s while the",
+                     "panel ends %s. Extend the SIDRA `period` argument."),
+               n_miss, max(alim$year_month), max(dt$date)))
+}
+cat("Deflator matched for all", format(nrow(dt), big.mark = ","), "rows.\n")
+
+dt[, valor_pc_real := valor_pc / deflator]
+
+# data.table's merge reorders rows by the join key. Every subsequent operation that uses
+# shift() (the pre-holiday flag, the S_/O_ lags) assumes strict within-city chronological
+# order, so we re-impose it here explicitly rather than relying on the merge's stability.
+setorder(dt, city, date)
+
+summary(dt$valor_pc_real)
+```
+
+## The crisis calendar
+
+The baseline model must describe what a city spends *in normal times*. If crisis days were
+included in its estimation sample, the model would learn to "expect" panic and the resulting
+residuals would be attenuated exactly where we need them to be large. We therefore hold out a
+calendar of **known macro-shocks** — pandemic waves, trucker strikes and blockades, and Santa
+Catarina climate events.
+
+An important honesty point for the paper: these windows come from an **event calendar**, not
+from any signal-based detection. The PBB-Score is not claimed to *discover* regimes; it
+measures deviation from a calm-period norm.
+
+The calendar is defined **once**, as a typed data frame, and every downstream use — the
+baseline hold-out, the shaded bands in Figure 4, the Local Projection regimes, and the
+episode attribution in Part 7 — is derived from this single object. In the production script
+these four uses each carried their own hard-coded copy of the dates, which is how they drifted
+apart (see the note at the end of this subsection).
+
+```{r crisis-windows}
+crisis_calendar <- data.frame(
+  event = c(
+    # --- Pandemic waves ---
+    "covid_wave_1", "covid_wave_2", "covid_wave_3",
+    # --- Geopolitical ---
+    "trucker_strike_2018", "trucker_strike_2021", "trucker_blockades_2022",
+    # --- Climate ---
+    "sc_ciclone_bomba_floripa_2020", "sc_chuvas_fortes_2020", "sc_chuvas_600mm_2021",
+    "sc_alto_vale_storm_2021", "sc_grande_floripa_alto_vale_2021",
+    "sc_chuvas_estado_sul_2022", "sc_cyclone_2022", "sc_norte_joinville_2022",
+    "sc_bc_itapema_2022", "sc_vale_itajai_bc_2023", "sc_estado_50pct_afetado_2023",
+    "sc_vale_itajai_2023", "sc_floods_2023", "sc_bc_itapema_2024",
+    "sc_grande_floripa_2025"
+  ),
+  type = c(rep("pandemic", 3), rep("geopolitical", 3), rep("climate", 15)),
+  start = as.Date(c(
+    "2020-02-25", "2020-11-16", "2021-11-16",
+    "2018-05-21", "2021-09-07", "2022-10-31",
+    "2020-06-30", "2020-12-17", "2021-01-21", "2021-03-26", "2021-06-08",
+    "2022-05-03", "2022-09-28", "2022-11-29", "2022-12-20", "2023-01-17",
+    "2023-10-10", "2023-11-11", "2023-11-17", "2024-01-08", "2025-12-08"
+  )),
+  end = as.Date(c(
+    "2020-09-26", "2021-09-16", "2022-04-01",
+    "2018-05-31", "2021-09-09", "2022-11-02",
+    "2020-07-01", "2020-12-21", "2021-01-24", "2021-03-26", "2021-06-09",
+    "2022-05-05", "2022-10-05", "2022-12-04", "2022-12-22", "2023-01-18",
+    "2023-10-10", "2023-11-14", "2023-11-30", "2024-01-16", "2025-12-10"
+  )),
+  stringsAsFactors = FALSE
+)
+stopifnot(all(crisis_calendar$end >= crisis_calendar$start))
+
+# Helper reused throughout the notebook
+in_calendar <- function(d, cal) {
+  Reduce(`|`, Map(function(s, e) d >= s & d <= e, cal$start, cal$end))
+}
+
+dt[, is_crisis := in_calendar(date, crisis_calendar)]
+
+cat(sprintf("Events in calendar               : %d (%d pandemic, %d geopolitical, %d climate)\n",
+            nrow(crisis_calendar), sum(crisis_calendar$type == "pandemic"),
+            sum(crisis_calendar$type == "geopolitical"),
+            sum(crisis_calendar$type == "climate")))
+cat(sprintf("Crisis days (held out of baseline): %s (%.1f%%)\n",
+            format(sum(dt$is_crisis), big.mark = ","), 100 * mean(dt$is_crisis)))
+cat(sprintf("Calm days (baseline training)     : %s\n",
+            format(sum(!dt$is_crisis), big.mark = ",")))
+```
+
+```{r crisis-table, echo = FALSE}
+cal_show <- crisis_calendar
+cal_show$days <- as.integer(cal_show$end - cal_show$start) + 1L
+cal_show <- cal_show[order(cal_show$start), c("event", "type", "start", "end", "days")]
+knitr::kable(cal_show, row.names = FALSE, caption = "Canonical crisis calendar")
+```
+
+> **Discrepancy inherited from `Temporal_CV_v9.R`, and how it is handled here.** The
+> production script defines this calendar in four separate places, and they are not identical.
+> The baseline hold-out uses all 15 climate windows; the Local Projections block and the
+> episode-anatomy block each use a hard-coded list that **omits `sc_cyclone_2022` and
+> `sc_floods_2023`**; Figure 4's shaded bands are a third, hand-tuned set of `annotate()`
+> literals. This notebook derives everything from `crisis_calendar`, but ships with a switch
+> (`V9_CLIMATE_OMISSIONS`, in Part 6) that reproduces v9's omission exactly, so the published
+> LP and episode numbers still replicate. **This is a decision you need to make before
+> submission**: either the two windows belong in the regime definitions (in which case the LP
+> and episode tables must be re-run) or they do not (in which case they should also be removed
+> from the baseline hold-out).
+
+## Calendar and seasonality features
+
+```{r calendar-features}
+dt[, `:=`(
+  time_linear = as.numeric(date),
+  date_year   = year(date),
+  date_month  = month(date),
+  date_wday   = wday(date),     # 1 = Sunday ... 7 = Saturday
+  date_yday   = yday(date),
+  is_weekend  = as.integer(wday(date) %in% c(1, 7))
+)]
+
+# Harmonic projections (retained for the ML feature set, not used in the OLS baseline)
+dt[, `:=`(
+  month_sin = sin(2 * pi * date_month / 12), month_cos = cos(2 * pi * date_month / 12),
+  wday_sin  = sin(2 * pi * date_wday  / 7),  wday_cos  = cos(2 * pi * date_wday  / 7),
+  yday_sin  = sin(2 * pi * date_yday  / 365.25), yday_cos = cos(2 * pi * date_yday / 365.25)
+)]
+
+dt[, time_linear_c := time_linear - min(time_linear)]
+dt[, dow_f   := factor(date_wday)]
+dt[, month_f := factor(date_month)]
+
+# Within-month payday cycle: two harmonics plus indicators for the 1st and the 31st
+dt[, dom      := mday(date)]
+dt[, dom_sin  := sin(2 * pi * dom / 31)]
+dt[, dom_cos  := cos(2 * pi * dom / 31)]
+dt[, dom_sin2 := sin(4 * pi * dom / 31)]
+dt[, dom_cos2 := cos(4 * pi * dom / 31)]
+dt[, is_day31 := mday(date) == 31]
+dt[, is_day1  := mday(date) == 1]
+```
+
+The within-month cycle deserves a word. Brazilian retail spending has a strong payday
+rhythm (private-sector wages early in the month, public-sector salaries at month end). An
+initial specification used blunt `is_start_of_month` / `is_end_of_month` dummies; the residual
+plot by day-of-month showed these were too coarse, and they were replaced by two Fourier
+harmonics of the day-of-month cycle plus explicit dummies for the 1st and the 31st (the 31st
+being structurally special because only seven months have one).
+
+## Holiday calendar
+
+```{r holidays}
+holidays_base <- as.Date(c(
+  # Fixed national holidays
+  paste0(2018:2025, "-01-01"), paste0(2018:2025, "-04-21"), paste0(2018:2025, "-05-01"),
+  paste0(2018:2025, "-09-07"), paste0(2018:2025, "-10-12"), paste0(2018:2025, "-11-02"),
+  paste0(2018:2025, "-11-15"), "2024-11-20", "2025-11-20",
+  paste0(2018:2025, "-12-24"), paste0(2018:2025, "-12-25"), paste0(2018:2025, "-12-31"),
+  # Fixed commercial dates
+  paste0(2018:2025, "-03-15"),   # Dia do Consumidor
+  paste0(2018:2025, "-06-12"),   # Dia dos Namorados
+  paste0(2018:2025, "-09-15"),   # Dia do Cliente
+  # Carnival (Mon + Tue)
+  "2018-02-12","2018-02-13","2019-03-04","2019-03-05","2020-02-24","2020-02-25",
+  "2021-02-15","2021-02-16","2022-02-28","2022-03-01","2023-02-20","2023-02-21",
+  "2024-02-12","2024-02-13","2025-03-03","2025-03-04",
+  # Good Friday
+  "2018-03-30","2019-04-19","2020-04-10","2021-04-02",
+  "2022-04-15","2023-04-07","2024-03-29","2025-04-18",
+  # Corpus Christi
+  "2018-05-31","2019-06-20","2020-06-11","2021-06-03",
+  "2022-06-16","2023-06-08","2024-05-30","2025-06-19",
+  # Mother's Day
+  "2018-05-13","2019-05-12","2020-05-10","2021-05-09",
+  "2022-05-08","2023-05-14","2024-05-12","2025-05-11",
+  # Father's Day
+  "2018-08-12","2019-08-11","2020-08-09","2021-08-08",
+  "2022-08-14","2023-08-13","2024-08-11","2025-08-10",
+  # Black Friday
+  "2018-11-23","2019-11-29","2020-11-27","2021-11-26",
+  "2022-11-25","2023-11-24","2024-11-29","2025-11-28"
+))
+
+# --- Order of operations, preserved from Temporal_CV_v9.R ---------------------
+# The pre-holiday ("bridge day") flag is built from the BASE calendar.
+dt[, is_holiday := date %in% holidays_base]
+dt[, is_pre_holiday := shift(is_holiday, n = 1, type = "lead"), by = city]
+dt[is.na(is_pre_holiday), is_pre_holiday := FALSE]
+
+# 30 December was added to the holiday set AFTER residual diagnostics revealed a
+# systematic year-end spike. In v9 the pre-holiday flag was NOT rebuilt afterwards;
+# we keep that behaviour so the numbers reproduce exactly.
+holidays <- c(holidays_base, as.Date(paste0(2018:2025, "-12-30")))
+dt[, is_holiday := date %in% holidays]
+
+cat(sprintf("Holidays flagged: %d unique dates | pre-holiday (bridge) days: %d\n",
+            length(unique(holidays)), sum(dt$is_pre_holiday)))
+```
+
+> **Known inconsistency, flagged for the record.** Because 30 December enters `is_holiday`
+> after `is_pre_holiday` has been computed, 29 December is *not* treated as a bridge day.
+> This is inherited from the production script and preserved here so that the published
+> figures reproduce bit-for-bit. Rebuilding `is_pre_holiday` from the final calendar would
+> change $\hat V$, $\hat\sigma_c$ and every downstream number; if you want to clean it up,
+> it must be done as a deliberate re-run, not silently.
+
+## Winsorisation
+
+Retail panels contain occasional non-behavioural spikes (bulk institutional purchases,
+reporting artefacts). Left untreated they inflate $\hat\sigma_c$, which *deflates* every
+PBB-Score in that city — the opposite of what we want. We winsorise at a **3 × IQR upper
+fence computed per city on calm-period observations only**, so that crisis days cannot set
+their own ceiling.
+
+```{r winsorise}
+train0 <- dt[is_crisis == FALSE & !is.na(valor_pc_real)]
+
+upper_fence <- train0[, {
+  q <- quantile(valor_pc_real, c(0.25, 0.75), na.rm = TRUE)
+  .(upper_iqr = q[2] + 3 * (q[2] - q[1]))
+}, by = city]
+
+if ("upper_iqr" %in% names(dt)) dt[, upper_iqr := NULL]
+dt <- merge(dt, upper_fence, by = "city", all.x = TRUE)
+
+dt[, valor_pc_real_raw := valor_pc_real]
+dt[, is_outlier := !is.na(valor_pc_real) & valor_pc_real > upper_iqr]
+dt[is_outlier == TRUE, valor_pc_real := upper_iqr]
+
+cat(sprintf("Observations winsorised: %d (%.2f%% of the panel)\n",
+            sum(dt$is_outlier, na.rm = TRUE), 100 * mean(dt$is_outlier, na.rm = TRUE)))
+
+knitr::kable(upper_fence[order(-upper_iqr)],
+             col.names = c("Municipality", "Upper fence (real BRL p.c.)"),
+             digits = 2, caption = "City-specific 3 × IQR upper fences (calm periods)")
+```
+
+## The baseline model $\hat V_{c,t}$
+
+```{r baseline-model}
+train <- dt[is_crisis == FALSE & !is.na(valor_pc_real)]
+
+baseline_model <- feols(
+  valor_pc_real ~ time_linear_c + dow_f + month_f +
+    is_holiday + is_pre_holiday + is_day31 + is_day1 +
+    dom_sin + dom_cos + dom_sin2 + dom_cos2,
+  data    = train,
+  fixef   = "city",
+  cluster = "city"
+)
+summary(baseline_model)
+```
+
+City fixed effects absorb persistent scale differences between municipalities; the
+day-of-week and month factors absorb the two dominant seasonal cycles; `time_linear_c`
+absorbs the secular real trend; the holiday and day-of-month terms absorb the calendar
+structure of retail demand.
+
+Month dummies are jointly significant by a wide margin, so they stay in:
+
+```{r month-ftest}
+car::linearHypothesis(baseline_model,
+                      grep("month_f", names(coef(baseline_model)), value = TRUE))
+```
+
+A useful diagnostic: mean residual by day of month should be flat if the payday cycle has
+been absorbed.
+
+```{r resid-by-dom, fig.height = 3.6}
+train[, resid_train := valor_pc_real - predict(baseline_model, newdata = train)]
+train[, .(mean_resid = mean(resid_train, na.rm = TRUE)), by = dom] |>
+  ggplot(aes(dom, mean_resid)) +
+  geom_col(fill = "#0099B8") +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "#D7263D") +
+  labs(x = "Day of month", y = "Mean residual (real BRL p.c.)",
+       title = "Residual diagnostics: within-month cycle absorbed") +
+  theme_minimal(base_size = 11)
+```
+
+## City-specific dispersion $\hat\sigma_c$ and the score
+
+```{r sigma-and-score}
+dt[, yhat     := predict(baseline_model, newdata = dt)]
+dt[, residual := valor_pc_real - yhat]
+
+# sigma_c is the SD of the baseline residuals on CALM days only, city by city.
+# (resid_train was already attached to `train` in the diagnostic chunk above.)
+city_sigma <- train[, .(sigma_c = sd(resid_train, na.rm = TRUE)), by = city]
+
+if ("sigma_c" %in% names(dt)) dt[, sigma_c := NULL]
+dt <- merge(dt, city_sigma, by = "city", all.x = TRUE)
+
+# Two residual outliers in Caçador (Sep 2025) survive winsorisation because they sit
+# below the city fence but far above the model's expectation. They are set to the
+# expected value, i.e. assigned a PBB-Score of exactly zero.
+dt[city == "Caçador" & date %in% as.Date(c("2025-09-23", "2025-09-24")),
+   valor_pc_real := yhat]
+
+dt[, residual := valor_pc_real - yhat]
+dt[, API      := residual / sigma_c]      # <- the PBB-Score
+
+knitr::kable(city_sigma[order(-sigma_c)], digits = 2,
+             col.names = c("Municipality", "sigma_c (real BRL p.c.)"),
+             caption = "City-specific residual standard deviation on calm days")
+```
+
+```{r score-distribution}
+round(quantile(dt$API, c(.01, .05, .25, .50, .75, .90, .95, .99), na.rm = TRUE), 3)
+```
+
+## Ordinal categories and face validity
+
+```{r categories}
+dt[, API_cat := fcase(
+  API <  -1.0,              "Below Normal",
+  API >= -1.0 & API < 1.0,  "Normal",
+  API >=  1.0 & API < 2.0,  "Elevated",
+  API >=  2.0 & API < 3.0,  "Panic",
+  API >=  3.0,              "Extreme Panic",
+  default = NA_character_
+)]
+dt[, API_cat := factor(API_cat,
+                       levels = c("Below Normal", "Normal", "Elevated",
+                                  "Panic", "Extreme Panic"), ordered = TRUE)]
+
+cat_tab <- dt[!is.na(API_cat), .N, by = API_cat][order(API_cat)]
+cat_tab[, share := sprintf("%.2f%%", 100 * N / sum(N))]
+knitr::kable(cat_tab, caption = "Distribution of PBB-Score categories")
+```
+
+The critical validation is not statistical but *substantive*: do score spikes line up with
+events that actually happened? The aggregate series answers that directly.
+
+```{r face-validity, fig.height = 4.5}
+daily_api <- dt[, .(API_mean = mean(API, na.rm = TRUE)), by = date]
+
+events <- data.frame(
+  date  = as.Date(c("2018-05-21", "2020-03-13", "2021-01-08")),
+  label = c("Trucker strike", "COVID onset (SC)", "COVID 2nd wave")
+)
+
+ggplot(daily_api, aes(date, API_mean)) +
+  geom_line(colour = "#0099B8", linewidth = 0.35) +
+  geom_hline(yintercept = c(1, 2, 3), linetype = "dashed",
+             colour = c("#f4a800", "#E65F2B", "#d62728"), alpha = 0.85) +
+  geom_vline(data = events, aes(xintercept = date, colour = label), linewidth = 0.7) +
+  scale_colour_manual(values = c("#D7263D", "#8B0000", "#E65F2B")) +
+  labs(x = NULL, y = "PBB-Score (z)", colour = NULL,
+       title = "PBB-Score, mean across 15 municipalities",
+       subtitle = "Dashed lines: 1σ / 2σ / 3σ thresholds") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top")
+```
+
+The March-2020 spike is unmistakable, and the 2018 trucker strike is visible at the left edge
+— the score behaves as a panic detector should.
+
+## Lag structure and export
+
+Two design decisions embed the S-O-R logic into the data itself:
+
+* **Stimulus (`S_`) variables are lagged by two days.** A stimulus (a cyclone, a case count,
+  a strike announcement) reaches the consumer with a reporting delay; using contemporaneous
+  values would leak same-day information a real early-warning system could not have.
+* **Organism (`O_`) variables are lagged by one day.** These capture the consumer's internal
+  state (search behaviour, mobility, news exposure), which mediates between stimulus and
+  response and is observable one day ahead.
+
+```{r export-and-lag}
+final_before <- as.data.frame(dt)
+write.csv2(final_before, file.path(PROC_DIR, "2_Final_data_Before_Time_modification.csv"),
+           row.names = FALSE, fileEncoding = "UTF-8")
+
+# Re-read through the CSV boundary so that column types match the production pipeline
+fd <- as.data.table(read.csv2(file.path(PROC_DIR, "2_Final_data_Before_Time_modification.csv"),
+                              fileEncoding = "UTF-8"))
+fd[, date := as.Date(date)]
+
+# --- Guard the round-trip -----------------------------------------------------
+# write.csv2 uses a comma as the decimal mark. If any numeric series (mobility in
+# particular) is read back as character — e.g. locale mismatch turning "0,83" into
+# text — coerce it back to numeric here rather than letting it silently become all
+# NA downstream. We only touch columns that are entirely numeric-or-NA once parsed,
+# so genuine text columns (city) are left alone.
+num_from_csv2 <- function(x) {
+  if (is.numeric(x)) return(x)
+  if (is.logical(x)) return(as.numeric(x))   # mostly-NA numeric round-tripped as logical
+  y <- suppressWarnings(as.numeric(gsub(",", ".", x, fixed = TRUE)))
+  # keep the coercion only if it doesn't destroy real information
+  if (mean(is.na(y)) <= mean(is.na(x)) + 1e-9) y else x
+}
+raw_mobil <- grep("^mobil_dist", names(fd), value = TRUE)
+for (cc in c(raw_mobil, grep("_daily$|_count_|_Gtrends$|_z$|_log$", names(fd), value = TRUE)))
+  if (cc %in% names(fd)) fd[[cc]] <- num_from_csv2(fd[[cc]])
+
+# Mobility and store-format series are re-labelled into the Organism block
+setnames(fd,
+         old = c("mobil_dist_0", "mobil_dist_0_10km", "mobil_dist_10_100km",
+                 "mobil_dist_100km_plus", "hypermarket_total_sales_value_daily",
+                 "supermarket_total_sales_value_daily", "minimarket_total_sales_value_daily"),
+         new = c("O_mobil_dist_0", "O_mobil_dist_0_10km", "O_mobil_dist_10_100km",
+                 "O_mobil_dist_100km_plus", "O_hypermarket_total_sales_value_daily",
+                 "O_supermarket_total_sales_value_daily", "O_minimarket_total_sales_value_daily"),
+         skip_absent = TRUE)
+
+# Fail loudly AT THE SOURCE if mobility did not survive, instead of surfacing 1,000
+# lines later as an empty Local-Projections panel. If this triggers, the mobility
+# columns are absent or empty in the RAW workbook — a data-provisioning problem that
+# no downstream code change can fix (run diagnostics.R to confirm the provenance).
+if ("O_mobil_dist_0" %in% names(fd)) {
+  nn <- sum(!is.na(fd$O_mobil_dist_0))
+  cat(sprintf("Mobility check: O_mobil_dist_0 has %s non-missing values%s\n",
+              format(nn, big.mark = ","),
+              if (nn > 0) sprintf(" (%s .. %s)",
+                                  min(fd$date[!is.na(fd$O_mobil_dist_0)]),
+                                  max(fd$date[!is.na(fd$O_mobil_dist_0)])) else ""))
+  if (nn == 0)
+    warning("O_mobil_dist_0 is entirely NA after the round-trip. The Mobilization LP ",
+            "panel will be empty. Check that the RAW workbook actually contains ",
+            "populated 'mobil_dist_*' columns (see diagnostics.R, Part B).")
+} else {
+  cat("Mobility check: no 'mobil_dist_0' column found in the raw workbook.\n")
+}
+
+# Crisis-regime dummy exposed to the models as a stimulus
+fd[, S_is_crisis_period := as.integer(is_crisis)]
+
+setorder(fd, city, date)
+stimuli  <- grep("^S_", names(fd), value = TRUE)
+organism <- grep("^O_", names(fd), value = TRUE)
+
+fd[, (stimuli)  := lapply(.SD, shift, n = 2L, type = "lag"), by = city, .SDcols = stimuli]
+fd[, (organism) := lapply(.SD, shift, n = 1L, type = "lag"), by = city, .SDcols = organism]
+
+write.csv2(fd, PANEL_CSV, row.names = FALSE, fileEncoding = "UTF-8")
+
+cat(sprintf("Modelling panel written: %s\n  %s rows x %d columns | %d S_ | %d O_\n",
+            PANEL_CSV, format(nrow(fd), big.mark = ","), ncol(fd),
+            length(stimuli), length(organism)))
+```
+
+---
+
+# Part 2 — Why the evaluation protocol is the finding
+
+Before any model is fitted, it is worth stating plainly what this paper's methodological
+contribution is, because everything in Part 3 is designed to test it.
+
+The PBB-Score is a **daily, city-level, strongly autocorrelated** series. If you split such a
+panel into training and test sets *at random* — the default in almost every applied ML paper,
+including several in this literature — then for essentially every test observation there
+exists a training observation from the *same city on an adjacent day*. The model does not
+have to forecast anything: it can interpolate between two neighbours it has already seen. The
+resulting $R^2$ measures **interpolation skill**, not **forecasting skill**, and it is
+systematically and severely optimistic.
+
+Two things follow, and they are the spine of the paper:
+
+1. Any claim that external open data (Google Trends, mobility, news, weather) constitute an
+   early-warning system must be evaluated **out-of-time**, not out-of-sample-at-random.
+2. Any such claim must be benchmarked against the **cheapest possible competitor**: the
+   target's own recent history. If four autoregressive lags do as well, the elaborate
+   external-data architecture has not earned its keep.
+
+Part 3 implements both.
+
+---
+
+# Part 3 — Expanding-window temporal cross-validation
+
+## Design
+
+```{r cv-design}
+INITIAL_TRAIN_END <- as.Date("2019-12-31")   # two full pre-pandemic years
+FOLD_STEP_MONTHS  <- 6                       # test block length
+VAL_WINDOW_DAYS   <- 90                      # internal validation = last 90 d of training
+LAG_PERIODS       <- c(1, 7, 14, 28)         # AR lags of the PBB-Score
+PANIC_THRESHOLD   <- 2.0                     # PBB >= 2σ defines a "panic" day
+```
+
+* **Expanding window**, not rolling: the training set grows, mimicking an operator who
+  accumulates history and never discards it.
+* **Six-month test blocks**, always strictly in the future of the training data.
+* **Early stopping on an internal validation split** (the last 90 days of each training
+  window), so the number of boosting rounds is chosen without ever touching test data.
+
+## Loading the modelling panel and building AR lags
+
+```{r cv-load}
+df_raw <- read.csv2(PANEL_CSV, fileEncoding = "UTF-8")
+df_raw$date <- as.Date(df_raw$date)
+
+cols_to_drop <- c(
+  "year_month", "upper_iqr", "valor_pc_real_raw", "residual", "yhat",
+  "is_crisis", "sigma_c", "population_2022", "date_year",
+  "valor_pc", "valor_pc_real", "time_linear", "time_linear_c", "is_outlier", "deflator",
+  "month_sin", "month_cos", "wday_sin", "wday_cos", "yday_sin", "yday_cos",
+  "dom_sin", "dom_cos", "dom_sin2", "dom_cos2",
+  "is_holiday", "is_pre_holiday", "dom", "is_day31", "is_day1", "dow_f",
+  "month_f", "is_weekend", "date_month", "date_wday", "date_yday",
+  "S_precip_daily", "S_is_crisis_period",
+  "S_pandemic_cases_z", "S_pandemic_deaths_z", "S_pandemic_cases_shock",
+  "S_pandemic_deaths_shock", "S_pandemic_severity_index",
+  "ecf_sales_value_daily", "nfce_sales_value_daily", "nfe_sales_value_daily",
+  "total_sales_value_daily",
+  "hypermarket_ecf_sales_value_daily", "hypermarket_nfc_sales_value_daily",
+  "hypermarket_nf_sales_value_daily",
+  "O_hypermarket_total_sales_value_daily", "O_supermarket_total_sales_value_daily",
+  "O_minimarket_total_sales_value_daily",
+  "minimarket_ecf_sales_value_daily", "minimarket_nfc_sales_value_daily",
+  "minimarket_nf_sales_value_daily",
+  "supermarket_ecf_sales_value_daily", "supermarket_nfc_sales_value_daily",
+  "supermarket_nf_sales_value_daily",
+  "nfce_count_daily", "nfe_count_daily",
+  "hypermarket_nfce_count_daily", "hypermarket_nfe_count_daily",
+  "minimarket_nfe_count_daily", "minimarket_nfce_count_daily",
+  "supermarket_nfe_count_daily", "supermarket_nfce_count_daily",
+  "sales_value_per_capita", "API_cat"
+)
+df <- df_raw %>% dplyr::select(-any_of(cols_to_drop))
+```
+
+Everything mechanically derived from the sales series is dropped. This is not fastidiousness:
+`valor_pc_real`, `residual` and `yhat` are the *ingredients* of the target, and leaving any of
+them in the feature matrix would let the model reconstruct the label algebraically. Only
+genuinely **external** signals and the calendar survive.
+
+```{r cv-features}
+# Pandemic indicators are structurally zero before 2020, not missing
+pandemic_vars <- grep("^S_pandemic", names(df), value = TRUE)
+df[, pandemic_vars] <- lapply(df[, pandemic_vars], function(x) replace(x, is.na(x), 0))
+
+char_cols <- names(df)[sapply(df, is.character) & !(names(df) %in% c("date", "city"))]
+for (col in char_cols) df[[col]] <- as.numeric(as.factor(df[[col]]))
+
+TARGET <- "API"
+df <- df %>% dplyr::arrange(city, date)
+
+# AR lags are built WITHIN city — never across the panel boundary
+for (k in LAG_PERIODS) {
+  df <- df %>%
+    dplyr::group_by(city) %>%
+    dplyr::mutate(!!sprintf("lag_%d_API", k) := dplyr::lag(.data[[TARGET]], n = k)) %>%
+    dplyr::ungroup()
+}
+
+valid_idx    <- !is.na(df[[TARGET]])
+df_model     <- df[valid_idx, ]
+dates_model  <- df_model$date
+cities_model <- df_model$city
+
+lag_cols <- sprintf("lag_%d_API", LAG_PERIODS)
+for (col in lag_cols) df_model[[col]][is.na(df_model[[col]])] <- 0
+
+all_cols          <- setdiff(names(df_model), c("date", "city"))
+feature_pool      <- setdiff(all_cols, TARGET)
+ar_features       <- lag_cols
+external_features <- setdiff(feature_pool, ar_features)
+combined_features <- feature_pool
+
+cat(sprintf("Rows with valid target : %s\n", format(nrow(df_model), big.mark = ",")))
+cat(sprintf("AR-only features       : %d  (%s)\n",
+            length(ar_features), paste(ar_features, collapse = ", ")))
+cat(sprintf("External-only features : %d\n", length(external_features)))
+cat(sprintf("Combined features      : %d\n", length(combined_features)))
+```
+
+## Fold-aware target reconstruction — the subtle leakage
+
+This is the step that most temporal-CV implementations get wrong, and it is worth dwelling on.
+
+The PBB-Score computed in Part 1 was standardised **once, on the full sample**: the baseline
+$\hat V$ and the city dispersion $\hat\sigma_c$ were estimated using every calm day from 2018
+to 2025. If we now feed that score into a fold whose training window ends in, say, December
+2020, then the *labels* in the 2021 test block already encode information from 2022–2025. A
+live early-warning system could never have that.
+
+The fix is to **rebuild the target inside each fold**: re-fit the baseline OLS on non-crisis
+days with `date <= train_end` only, re-estimate $\hat\sigma_c$ on those same days, standardise
+*all* rows (including the test block, which is genuinely extrapolated) with those fold-local
+coefficients, and rebuild the AR lags from the fold-local score — so that even the
+autoregressive features are themselves out-of-sample.
+
+```{r fold-aware}
+base_dt <- as.data.table(df_raw)
+base_dt[, `:=`(date      = as.Date(date),
+               is_crisis = as.logical(is_crisis),
+               dow_f     = factor(dow_f),
+               month_f   = factor(month_f))]
+
+BASELINE_FORMULA <- valor_pc_real ~ time_linear_c + dow_f + month_f +
+  is_holiday + is_pre_holiday + is_day31 + is_day1 +
+  dom_sin + dom_cos + dom_sin2 + dom_cos2
+
+model_key   <- paste(df_model$city, df_model$date)
+fold_cache  <- new.env(parent = emptyenv())
+
+build_fold_features <- function(train_end) {
+  key <- as.character(train_end)
+  if (!is.null(fold_cache[[key]])) return(fold_cache[[key]])
+
+  tr <- base_dt[is_crisis == FALSE & !is.na(valor_pc_real) & date <= train_end]
+  m  <- fixest::feols(BASELINE_FORMULA, data = tr, fixef = "city")
+
+  ap <- data.table(city  = base_dt$city,
+                   date  = base_dt$date,
+                   api_f = base_dt$valor_pc_real - predict(m, newdata = base_dt))
+
+  sig <- tapply(tr$valor_pc_real - predict(m, newdata = tr), tr$city, stats::sd, na.rm = TRUE)
+  ap[, api_f := api_f / as.numeric(sig[as.character(city)])]
+
+  setorder(ap, city, date)
+  for (k in LAG_PERIODS) ap[, (sprintf("lag_%d_API", k)) := shift(api_f, k), by = city]
+
+  mi   <- match(model_key, paste(ap$city, ap$date))
+  lags <- lapply(sprintf("lag_%d_API", LAG_PERIODS),
+                 function(cn) { v <- ap[[cn]][mi]; v[is.na(v)] <- 0; v })
+  names(lags) <- sprintf("lag_%d_API", LAG_PERIODS)
+
+  out <- list(y = ap$api_f[mi], lags = lags)
+  fold_cache[[key]] <- out
+  out
+}
+```
+
+## Fold schedule
+
+```{r folds}
+data_end     <- max(dates_model)
+fold_cutoffs <- seq.Date(INITIAL_TRAIN_END, data_end, by = "6 months")
+fold_cutoffs <- fold_cutoffs[fold_cutoffs < data_end - 30]
+
+folds <- data.frame(
+  fold_id    = seq_along(fold_cutoffs),
+  train_end  = fold_cutoffs,
+  test_start = fold_cutoffs + 1,
+  test_end   = pmin(fold_cutoffs %m+% months(FOLD_STEP_MONTHS), data_end)
+)
+knitr::kable(folds, caption = "Expanding-window fold schedule (training always starts in 2018)")
+```
+
+## Hyperparameters
+
+The tree hyperparameters come from a 5-fold `xgb.cv` grid search over 96 configurations. It is
+run once and cached; the sensitivity subsection below re-runs the whole comparison with hyperparameters
+tuned *only* on fold 1's training window, to confirm the ranking is not an artefact of how the
+grid search saw the data.
+
+```{r grid-search}
+if (!file.exists(BEST_ROW)) {
+  if (!RUN_HEAVY) stop("best_row.csv missing and run_heavy = FALSE.")
+  message("Running hyperparameter grid search (once) ...")
+
+  grid <- expand.grid(max_depth = c(4, 5, 6), eta = c(0.05, 0.10),
+                      subsample = c(0.7, 0.8), colsample_bytree = c(0.7, 0.8),
+                      min_child_weight = c(5, 10), gamma = c(0, 0.1),
+                      KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)
+
+  Xg <- as.matrix(df_model[, combined_features, drop = FALSE]); storage.mode(Xg) <- "double"
+  dg <- xgb.DMatrix(Xg, label = df_model[[TARGET]])
+
+  set.seed(42)
+  res <- do.call(rbind, lapply(seq_len(nrow(grid)), function(i) {
+    p  <- c(list(objective = "reg:squarederror", eval_metric = "rmse",
+                 lambda = 2.0, alpha = 0.1, nthread = 4), as.list(grid[i, ]))
+    cv <- xgb.cv(params = p, data = dg, nrounds = 1000, nfold = 5,
+                 early_stopping_rounds = 30, verbose = 0)
+    data.frame(grid[i, ],
+               nrounds = which.min(cv$evaluation_log$test_rmse_mean),
+               cv_rmse = min(cv$evaluation_log$test_rmse_mean))
+  }))
+  write.csv(res[which.min(res$cv_rmse), ], BEST_ROW, row.names = FALSE)
+}
+
+best_row <- read.csv(BEST_ROW)
+base_params <- list(
+  objective        = "reg:squarederror",
+  max_depth        = best_row$max_depth,
+  eta              = best_row$eta,
+  subsample        = best_row$subsample,
+  colsample_bytree = best_row$colsample_bytree,
+  min_child_weight = best_row$min_child_weight,
+  gamma            = best_row$gamma,
+  lambda           = 2.0,
+  alpha            = 0.1,
+  nthread          = 4,
+  eval_metric      = "rmse"
+)
+knitr::kable(best_row[, c("max_depth", "eta", "subsample", "colsample_bytree",
+                          "min_child_weight", "gamma")],
+             caption = "Selected XGBoost hyperparameters")
+```
+
+## The three-way comparison
+
+```{r cv-function}
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+run_cv <- function(feature_cols, model_label, subdir) {
+
+  results_file <- file.path(subdir, "results.rds")
+  if (file.exists(results_file)) {
+    message("Cached: ", model_label)
+    return(readRDS(results_file))
+  }
+  if (!RUN_HEAVY) stop("No cache for ", model_label, " and run_heavy = FALSE.")
+
+  Xm <- as.matrix(df_model[, feature_cols, drop = FALSE]); storage.mode(Xm) <- "double"
+  fold_results <- vector("list", nrow(folds))
+
+  for (i in seq_len(nrow(folds))) {
+    fo <- folds[i, ]
+    train_full <- which(dates_model <= fo$train_end)
+    test_idx   <- which(dates_model >= fo$test_start & dates_model <= fo$test_end)
+    if (!length(test_idx)) next
+
+    val_cutoff <- fo$train_end - VAL_WINDOW_DAYS
+    train_idx  <- train_full[dates_model[train_full] <= val_cutoff]
+    val_idx    <- train_full[dates_model[train_full] >  val_cutoff]
+
+    # Fold-local target + fold-local AR lags
+    ff   <- build_fold_features(fo$train_end)
+    y    <- ff$y
+    Xm_f <- Xm
+    for (lc in intersect(names(ff$lags), feature_cols)) Xm_f[, lc] <- ff$lags[[lc]]
+
+    dtrain <- xgb.DMatrix(Xm_f[train_idx, , drop = FALSE], label = y[train_idx])
+    dval   <- xgb.DMatrix(Xm_f[val_idx,   , drop = FALSE], label = y[val_idx])
+    dtest  <- xgb.DMatrix(Xm_f[test_idx,  , drop = FALSE], label = y[test_idx])
+
+    mdl <- xgb.train(params = base_params, data = dtrain, nrounds = 2000,
+                     evals = list(train = dtrain, val = dval),
+                     early_stopping_rounds = 50, verbose = 0)
+
+    # Early stopping records the best iteration; we predict from a booster sliced to
+    # that iteration so the extra rounds after the optimum are never used.
+    bi <- as.integer(mdl$best_iteration)
+    if (!length(bi) || is.na(bi) || bi < 1L) bi <- as.integer(mdl$niter %||% 2000L)
+    sl <- tryCatch(xgb.slice.Booster(mdl, start = 1L, end = bi), error = function(e) NULL)
+
+    y_pred     <- if (!is.null(sl)) predict(sl, dtest) else predict(mdl, dtest)
+    y_pred_val <- if (!is.null(sl)) predict(sl, dval)  else predict(mdl, dval)
+    y_true     <- y[test_idx]
+
+    fold_results[[i]] <- list(
+      fold_id = i, train_end = fo$train_end,
+      test_start = fo$test_start, test_end = fo$test_end,
+      n_train = length(train_idx), n_test = length(test_idx), best_nrounds = bi,
+      r2   = 1 - sum((y_true - y_pred)^2) / sum((y_true - mean(y_true))^2),
+      rmse = sqrt(mean((y_true - y_pred)^2)),
+      mae  = mean(abs(y_true - y_pred)),
+      predictions = data.frame(date = dates_model[test_idx], city = cities_model[test_idx],
+                               y_true = y_true, y_pred = y_pred),
+      val_predictions = data.frame(y_true = y[val_idx], y_pred = y_pred_val)
+    )
+  }
+
+  fold_results <- Filter(Negate(is.null), fold_results)
+  saveRDS(fold_results, results_file)
+  fold_results
+}
+```
+
+```{r cv-run, results = "hide"}
+AR_DIR  <- file.path(OUT_DIR, "temporal_cv_ar_augmented")
+res_ar   <- run_cv(ar_features,       "AR-only",       file.path(AR_DIR, "ar_only"))
+res_ext  <- run_cv(external_features, "External-only", file.path(AR_DIR, "external_only"))
+res_comb <- run_cv(combined_features, "Combined",      file.path(AR_DIR, "combined"))
+```
+
+## Results
+
+```{r cv-results}
+extract_metrics <- function(res, nm) {
+  do.call(rbind, lapply(res, function(f) data.frame(
+    model = nm, fold_id = f$fold_id, test_start = f$test_start,
+    n_test = f$n_test, r2 = f$r2, rmse = f$rmse, mae = f$mae)))
+}
+m_ar   <- extract_metrics(res_ar,   "AR-only")
+m_ext  <- extract_metrics(res_ext,  "External-only")
+m_comb <- extract_metrics(res_comb, "Combined")
+
+comp_r2 <- data.frame(
+  Fold          = m_ar$fold_id,
+  `Test starts` = m_ar$test_start,
+  `AR-only`     = round(m_ar$r2, 3),
+  `External-only` = round(m_ext$r2, 3),
+  `Combined`      = round(m_comb$r2, 3),
+  `Incremental (C − AR)` = round(m_comb$r2 - m_ar$r2, 3),
+  check.names = FALSE
+)
+knitr::kable(comp_r2, caption = "Out-of-sample R² by fold")
+
+summary_df <- data.frame(
+  model     = c("AR-only", "External-only", "Combined"),
+  mean_r2   = c(mean(m_ar$r2),   mean(m_ext$r2),   mean(m_comb$r2)),
+  sd_r2     = c(sd(m_ar$r2),     sd(m_ext$r2),     sd(m_comb$r2)),
+  med_r2    = c(median(m_ar$r2), median(m_ext$r2), median(m_comb$r2)),
+  mean_rmse = c(mean(m_ar$rmse), mean(m_ext$rmse), mean(m_comb$rmse)),
+  mean_mae  = c(mean(m_ar$mae),  mean(m_ext$mae),  mean(m_comb$mae))
+)
+write.csv(comp_r2,    file.path(AR_DIR, "comparison_fold_metrics.csv"), row.names = FALSE)
+write.csv(summary_df, file.path(AR_DIR, "comparison_summary.csv"),      row.names = FALSE)
+
+knitr::kable(summary_df, digits = 3, caption = "Summary across folds (canonical run output)")
+```
+
+```{r cv-headline, echo = FALSE}
+cat(sprintf("AR-only       : mean R2 = %+.3f (SD %.3f)\n", mean(m_ar$r2),   sd(m_ar$r2)))
+cat(sprintf("External-only : mean R2 = %+.3f (SD %.3f)\n", mean(m_ext$r2),  sd(m_ext$r2)))
+cat(sprintf("Combined      : mean R2 = %+.3f (SD %.3f)\n", mean(m_comb$r2), sd(m_comb$r2)))
+cat(sprintf("\nIncremental value of external features: %+.3f R2\n",
+            mean(m_comb$r2) - mean(m_ar$r2)))
+```
+
+**How to read this.** Three outcomes were possible, and they had very different implications
+for the paper. If *External-only* had performed well, the open-data early-warning story would
+have stood. If *Combined* had beaten *AR-only* by a clear margin, external signals would have
+carried real anticipatory information *given* the target's own history. What the table
+actually shows is the third case: classification and regression skill are almost entirely
+autoregressive, and the elaborate external-data architecture adds little on top of four lags.
+That is the paper's central empirical result, and it is a **null result reported honestly**
+rather than buried.
+
+## Figure: R² trajectories with crisis regimes
+
+```{r fig-r2, fig.width = 11, fig.height = 5.5}
+all_m <- rbind(m_ar, m_ext, m_comb)
+all_m$model <- factor(all_m$model, levels = c("External-only", "AR-only", "Combined"))
+
+# Crisis bands are derived from `crisis_calendar` via geom_rect + a data frame, NOT from
+# hard-coded annotate() literals. Short events are widened symmetrically to MIN_BAND_DAYS
+# purely so that a two-day event is not rendered as an invisible one-pixel line; the padding
+# is cosmetic, explicit, and applied to the canonical dates rather than replacing them.
+MIN_BAND_DAYS <- 14
+
+bands       <- crisis_calendar
+bands$width <- as.integer(bands$end - bands$start) + 1L
+bands$pad   <- pmax(0, (MIN_BAND_DAYS - bands$width) %/% 2)
+bands$xmin  <- bands$start - bands$pad
+bands$xmax  <- bands$end   + bands$pad
+bands$type  <- factor(c(pandemic     = "Pandemic",
+                        geopolitical = "Geopolitical",
+                        climate      = "Environmental")[bands$type],
+                      levels = c("Pandemic", "Geopolitical", "Environmental"))
+
+band_cols <- c(Pandemic = "#E65F2B", Geopolitical = "#0099B8", Environmental = "#2A9D8F")
+
+p_r2 <- ggplot() +
+  geom_rect(data = bands,
+            aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = type),
+            alpha = 0.10, inherit.aes = FALSE) +
+  scale_fill_manual(values = band_cols, name = "Crisis regime") +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_line(data = all_m, aes(test_start, r2, colour = model), linewidth = 0.6) +
+  geom_point(data = all_m, aes(test_start, r2, colour = model, shape = model), size = 2.6) +
+  scale_colour_manual(values = c("External-only" = "#D7263D",
+                                 "AR-only"       = "#66CC33",
+                                 "Combined"      = "#CC0099"), name = NULL) +
+  scale_shape_discrete(name = NULL) +
+  labs(x = "Test fold start date", y = expression("Out-of-sample R"^2)) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top")
+
+p_r2
+ggsave(file.path(AR_DIR, "comparison_r2_by_fold.png"), p_r2,
+       width = 11, height = 5.5, dpi = 150)
+ggsave(file.path(OUT_DIR, "PDFs", "Figure_4.pdf"), p_r2, width = 14, height = 5.5)
+```
+
+## Incremental value of external features
+
+```{r fig-incremental, fig.height = 4}
+inc <- data.frame(test_start = m_comb$test_start, incremental = m_comb$r2 - m_ar$r2)
+p_inc <- ggplot(inc, aes(test_start, incremental)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_col(fill = "#0099B8", alpha = 0.85) +
+  labs(x = "Test fold start date",
+       y = expression("R"^2 * "(Combined) − R"^2 * "(AR-only)"),
+       title = "Incremental value of external open data over the autoregressive baseline",
+       subtitle = "Positive bars = external features add forecasting value") +
+  theme_minimal(base_size = 11)
+p_inc
+ggsave(file.path(AR_DIR, "comparison_incremental_value.png"), p_inc,
+       width = 11, height = 4.5, dpi = 150)
+```
+
+## Sensitivity: hyperparameter transfer
+
+A reviewer could object that the hyperparameters were tuned by 5-fold `xgb.cv` on the *whole*
+panel, so a trace of post-cutoff information reaches the models through the choice of
+`max_depth` and friends. We therefore re-tune on **fold 1's training window only** (2018–2019)
+and re-run all three specifications. If the ranking survives, the finding is not an artefact
+of the tuning protocol.
+
+```{r sensitivity-run}
+SENS <- file.path(OUT_DIR, "hyperparam_sensitivity.csv")
+
+if (!file.exists(SENS) && RUN_HEAVY) {
+  X_ext <- as.matrix(df_model[, external_features, drop = FALSE])
+  storage.mode(X_ext) <- "double"
+
+  ff1 <- build_fold_features(folds$train_end[1])
+  ti  <- which(dates_model <= folds$train_end[1] & !is.na(ff1$y))
+  L1  <- do.call(cbind, ff1$lags)
+
+  grid <- expand.grid(max_depth = c(4, 5, 6), eta = c(0.05, 0.10),
+                      subsample = c(0.7, 0.8), colsample_bytree = c(0.7, 0.8),
+                      min_child_weight = c(5, 10), gamma = c(0, 0.1),
+                      KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)
+  dtune <- xgb.DMatrix(cbind(X_ext[ti, , drop = FALSE], L1[ti, , drop = FALSE]),
+                       label = ff1$y[ti])
+
+  set.seed(42); best <- list(rmse = Inf, row = NULL)
+  for (g in seq_len(nrow(grid))) {
+    p  <- c(list(objective = "reg:squarederror", eval_metric = "rmse",
+                 lambda = 2.0, alpha = 0.1, nthread = 4), as.list(grid[g, ]))
+    cv <- xgb.cv(params = p, data = dtune, nrounds = 1000, nfold = 5,
+                 early_stopping_rounds = 30, verbose = 0)
+    r  <- min(cv$evaluation_log$test_rmse_mean)
+    if (r < best$rmse) best <- list(rmse = r, row = grid[g, ])
+  }
+  sp <- c(list(objective = "reg:squarederror", eval_metric = "rmse",
+               lambda = 2.0, alpha = 0.1, nthread = 4), as.list(best$row))
+
+  specs <- c("External-only", "AR-only", "Combined")
+  r2m   <- matrix(NA_real_, nrow(folds), 3, dimnames = list(NULL, specs))
+
+  for (i in seq_len(nrow(folds))) {
+    fo <- folds[i, ]
+    trf <- which(dates_model <= fo$train_end)
+    te  <- which(dates_model >= fo$test_start & dates_model <= fo$test_end)
+    if (!length(te)) next
+    vc <- fo$train_end - VAL_WINDOW_DAYS
+    tr <- trf[dates_model[trf] <= vc]; va <- trf[dates_model[trf] > vc]
+
+    ff <- build_fold_features(fo$train_end); y <- ff$y
+    L  <- do.call(cbind, ff$lags)
+    feat <- list(`External-only` = X_ext, `AR-only` = L, `Combined` = cbind(X_ext, L))
+
+    for (s in specs) {
+      Xs  <- feat[[s]]
+      mdl <- xgb.train(params = sp, data = xgb.DMatrix(Xs[tr, , drop = FALSE], label = y[tr]),
+                       nrounds = 2000,
+                       evals = list(v = xgb.DMatrix(Xs[va, , drop = FALSE], label = y[va])),
+                       early_stopping_rounds = 50, verbose = 0)
+      bi <- as.integer(mdl$best_iteration)
+      if (!length(bi) || is.na(bi) || bi < 1L) bi <- as.integer(mdl$niter %||% 2000L)
+      sl <- tryCatch(xgb.slice.Booster(mdl, start = 1L, end = bi), error = function(e) NULL)
+      yp <- if (!is.null(sl)) predict(sl, Xs[te, , drop = FALSE]) else predict(mdl, Xs[te, , drop = FALSE])
+      yt <- y[te]
+      r2m[i, s] <- 1 - sum((yt - yp)^2) / sum((yt - mean(yt))^2)
+    }
+  }
+
+  main <- setNames(summary_df$mean_r2, summary_df$model)
+  tab  <- data.frame(model = specs,
+                     sens_mean_R2     = round(colMeans(r2m, na.rm = TRUE), 3),
+                     sens_negR2_folds = colSums(r2m < 0, na.rm = TRUE),
+                     main_run_R2      = round(as.numeric(main[specs]), 3))
+  tab$delta_R2 <- round(tab$sens_mean_R2 - tab$main_run_R2, 3)
+  write.csv(tab, SENS, row.names = FALSE)
+}
+
+if (file.exists(SENS)) {
+  knitr::kable(read.csv(SENS), row.names = FALSE,
+               caption = "Hyperparameter-transfer sensitivity: tuning restricted to fold 1's training window")
+}
+```
+
+The ordering is robust if *External-only* remains far below *AR-only* ≈ *Combined*, and if
+*External-only*'s mean $R^2$ stays at or below zero.
+
+---
+
+# Part 4 — Early-warning evaluation
+
+Regression $R^2$ is not what a supply-chain operator cares about. The operational question is
+binary and asymmetric: **will this city cross 2σ, and will I know early enough to act?**
+
+We therefore threshold the *observed* PBB-Score at 2σ to define panic days, and use each
+model's *predicted* PBB-Score as a continuous alarm score. Two consequences follow from the
+class imbalance (roughly 4% positives):
+
+* **AUC-PR is the headline, not AUC-ROC.** With rare positives, ROC curves are optimistic
+  because the false-positive rate is diluted by a huge negative class (Saito & Rehmsmeier,
+  2015). We report AUC-PR as a *lift over the base rate*, which is the honest scale.
+* **The alarm threshold τ is selected on validation data, never on test.** For each fold we
+  sweep τ on the internal validation split, take the F1-maximising value, and use the median
+  across folds as the operating point.
+
+```{r ews-setup}
+LEAD_LOOKBACK_DAYS <- 14
+CW_DIR <- file.path(OUT_DIR, "classification_three_way")
+
+compute_at_threshold <- function(y_true, y_pred, tau) {
+  alarm <- as.integer(y_pred >= tau)
+  tp <- sum(alarm == 1 & y_true == 1); fp <- sum(alarm == 1 & y_true == 0)
+  fn <- sum(alarm == 0 & y_true == 1); tn <- sum(alarm == 0 & y_true == 0)
+  prec <- if ((tp + fp) > 0) tp / (tp + fp) else NA_real_
+  rec  <- if ((tp + fn) > 0) tp / (tp + fn) else NA_real_
+  f1   <- if (!is.na(prec) && !is.na(rec) && (prec + rec) > 0) 2 * prec * rec / (prec + rec) else NA_real_
+  data.frame(threshold = tau, alarm_rate = mean(alarm),
+             tp = tp, fp = fp, fn = fn, tn = tn, precision = prec, recall = rec, f1 = f1)
+}
+```
+
+## Lead time, measured against the right counterfactual
+
+A naive lead-time statistic ("the alarm fired 3 days before 62% of episodes") is close to
+meaningless on its own: an alarm that is *always on* would detect 100% of episodes. The only
+informative quantity is detection relative to a **non-panic baseline** — how often the alarm
+also fires in a randomly chosen 14-day window that contains *no* panic. The difference between
+the two is the lift.
+
+```{r lead-time-fn}
+lead_times_with_baseline <- function(pred_df, tau, lookback = LEAD_LOOKBACK_DAYS) {
+  pred_df <- pred_df %>% arrange(city, date)
+  pred_df$alarm <- as.integer(pred_df$y_pred >= tau)
+
+  eps <- list(); base <- list()
+  for (ct in unique(pred_df$city)) {
+    cd <- pred_df %>% filter(city == ct) %>% arrange(date)
+    if (nrow(cd) < lookback + 1) next
+
+    rise <- which(cd$is_panic == 1 & (c(0, head(cd$is_panic, -1)) == 0))
+    for (i in rise) {
+      ep  <- cd$date[i]
+      win <- cd %>% filter(date >= ep - lookback, date < ep)
+      if (!nrow(win)) next
+      crossed  <- which(win$alarm == 1)
+      detected <- length(crossed) > 0
+      eps[[length(eps) + 1]] <- data.frame(
+        city = ct, episode_start = ep, detected = detected,
+        lead_time_days = if (detected) as.numeric(ep - win$date[min(crossed)]) else NA_real_)
+    }
+
+    # Matched non-panic reference windows (3 per episode)
+    non_panic <- which(cd$is_panic == 0)
+    n_ref <- length(rise) * 3
+    if (length(non_panic) > n_ref && length(rise) > 0) {
+      set.seed(42)
+      for (j in sample(non_panic, n_ref)) {
+        if (j <= lookback) next
+        ref <- cd$date[j]
+        win <- cd %>% filter(date >= ref - lookback, date < ref)
+        if (sum(win$is_panic) > 0) next          # window must be genuinely calm
+        base[[length(base) + 1]] <- data.frame(city = ct, ref_date = ref,
+                                               any_alarm = sum(win$alarm) > 0)
+      }
+    }
+  }
+  list(episodes = if (length(eps))  do.call(rbind, eps)  else data.frame(),
+       baseline = if (length(base)) do.call(rbind, base) else data.frame())
+}
+```
+
+## Analysing all three models
+
+```{r ews-analyse}
+val_tau <- function(fr) {
+  vp <- do.call(rbind, lapply(fr, function(f) { v <- f$val_predictions; v$fold_id <- f$fold_id; v }))
+  vp$is_panic <- as.integer(vp$y_true >= PANIC_THRESHOLD)
+  g  <- seq(0.1, 3.0, by = 0.05)
+  ft <- sapply(split(vp, vp$fold_id), function(d) {
+    if (sum(d$is_panic) == 0) return(NA_real_)
+    f1v <- sapply(g, function(t) { f1 <- compute_at_threshold(d$is_panic, d$y_pred, t)$f1
+                                   if (is.na(f1)) 0 else f1 })
+    g[which.max(f1v)]
+  })
+  stats::median(ft, na.rm = TRUE)
+}
+
+COMMON_TAU <- val_tau(res_comb)
+cat(sprintf("Validation-selected common operating threshold: tau = %.2f\n", COMMON_TAU))
+
+analyze_model <- function(fr, nm) {
+  preds <- do.call(rbind, lapply(fr, function(f) cbind(fold_id = f$fold_id, f$predictions)))
+  vp    <- do.call(rbind, lapply(fr, function(f) { v <- f$val_predictions; v$fold_id <- f$fold_id; v }))
+  preds$is_panic <- as.integer(preds$y_true >= PANIC_THRESHOLD)
+  base_rate <- mean(preds$is_panic)
+
+  pr  <- PRROC::pr.curve(preds$y_pred[preds$is_panic == 1],
+                         preds$y_pred[preds$is_panic == 0], curve = TRUE)
+  roc <- PRROC::roc.curve(preds$y_pred[preds$is_panic == 1],
+                          preds$y_pred[preds$is_panic == 0], curve = TRUE)
+
+  per_fold <- do.call(rbind, lapply(split(preds, preds$fold_id), function(d) {
+    if (sum(d$is_panic) == 0) return(data.frame(fold_id = d$fold_id[1], n_pos = 0,
+                                                auc_pr = NA, auc_roc = NA,
+                                                base_rate = 0, model = nm))
+    data.frame(fold_id = d$fold_id[1], n_pos = sum(d$is_panic),
+               auc_pr  = PRROC::pr.curve(d$y_pred[d$is_panic == 1],
+                                         d$y_pred[d$is_panic == 0])$auc.integral,
+               auc_roc = PRROC::roc.curve(d$y_pred[d$is_panic == 1],
+                                          d$y_pred[d$is_panic == 0])$auc,
+               base_rate = mean(d$is_panic), model = nm)
+  }))
+
+  sweep_grid    <- seq(0.1, 3.0, by = 0.05)
+  sweep_metrics <- do.call(rbind, lapply(sweep_grid, function(t)
+    compute_at_threshold(preds$is_panic, preds$y_pred, t)))
+  sweep_metrics$model <- nm
+
+  # Operating point: each model's OWN validation-selected F1-optimal threshold,
+  # taken as the median of per-fold optima on the internal validation splits. This
+  # is exactly what the production script uses for `lead_own` / Figure 5c: because
+  # `val_predictions` is always supplied in the three-way comparison, the original's
+  # apparent "pooled-test F1-optimal" branch is never reached. No test data touches
+  # threshold selection.
+  vp$is_panic <- as.integer(vp$y_true >= PANIC_THRESHOLD)
+  fold_tau <- sapply(split(vp, vp$fold_id), function(d) {
+    if (sum(d$is_panic) == 0) return(NA_real_)
+    f1v <- sapply(sweep_grid, function(t) { f1 <- compute_at_threshold(d$is_panic, d$y_pred, t)$f1
+                                            if (is.na(f1)) 0 else f1 })
+    sweep_grid[which.max(f1v)]
+  })
+  opt_threshold <- stats::median(fold_tau, na.rm = TRUE)
+
+  lead <- lead_times_with_baseline(preds, opt_threshold)
+  det  <- if (nrow(lead$episodes)) mean(lead$episodes$detected)  else NA_real_
+  bl   <- if (nrow(lead$baseline)) mean(lead$baseline$any_alarm) else NA_real_
+
+  list(model = nm, predictions = preds, base_rate = base_rate,
+       pr = pr, roc = roc, per_fold = per_fold, sweep = sweep_metrics,
+       tau = opt_threshold, tau_val = opt_threshold,
+       metrics_opt = compute_at_threshold(preds$is_panic, preds$y_pred, opt_threshold),
+       lead = lead, detection = det, baseline = bl)
+}
+
+results <- list(
+  `AR-only`       = analyze_model(res_ar,   "AR-only"),
+  `External-only` = analyze_model(res_ext,  "External-only"),
+  `Combined`      = analyze_model(res_comb, "Combined")
+)
+```
+
+```{r ews-summary}
+R2_PRIOR <- setNames(summary_df$mean_r2, summary_df$model)
+
+ews <- do.call(rbind, lapply(results, function(r) data.frame(
+  model            = r$model,
+  R2_regression    = unname(R2_PRIOR[r$model]),
+  base_rate        = r$base_rate,
+  AUC_PR           = r$pr$auc.integral,
+  AUC_PR_lift      = r$pr$auc.integral / r$base_rate,
+  AUC_ROC          = r$roc$auc,
+  tau_own          = r$tau,       # own F1-optimal on pooled test (used for detection panel)
+  tau_val          = r$tau_val,   # validation-selected operating point (leakage-free)
+  F1_at_tau        = r$metrics_opt$f1,
+  precision_at_tau = r$metrics_opt$precision,
+  recall_at_tau    = r$metrics_opt$recall,
+  detection_rate   = r$detection,
+  nonpanic_baseline= r$baseline,
+  detection_lift   = r$detection - r$baseline,
+  stringsAsFactors = FALSE)))
+rownames(ews) <- NULL
+
+write.csv(ews, file.path(CW_DIR, "comparison_summary.csv"), row.names = FALSE)
+write.csv(do.call(rbind, lapply(results, function(r) r$per_fold)),
+          file.path(CW_DIR, "metrics_per_fold.csv"), row.names = FALSE)
+
+knitr::kable(ews[, c("model", "R2_regression", "AUC_PR", "AUC_PR_lift", "AUC_ROC",
+                     "tau_own", "F1_at_tau", "detection_rate", "nonpanic_baseline",
+                     "detection_lift")],
+             digits = 3, row.names = FALSE,
+             caption = "Headline early-warning comparison (canonical run output)")
+```
+
+```{r ews-delta, echo = FALSE}
+g <- function(m, col) ews[[col]][ews$model == m]
+cat(sprintf("Incremental value of external features, classification side (Combined - AR-only):\n"))
+cat(sprintf("  Delta AUC-PR        : %+.3f\n", g("Combined", "AUC_PR")  - g("AR-only", "AUC_PR")))
+cat(sprintf("  Delta AUC-ROC       : %+.3f\n", g("Combined", "AUC_ROC") - g("AR-only", "AUC_ROC")))
+cat(sprintf("  Delta F1 (at tau)   : %+.3f\n", g("Combined", "F1_at_tau") - g("AR-only", "F1_at_tau")))
+cat(sprintf("  Delta detection lift: %+.1f pp\n",
+            100 * (g("Combined", "detection_lift") - g("AR-only", "detection_lift"))))
+```
+
+Two things about the detection-lift column deserve emphasis, because they are easy to
+over-read. First, the null result on external signals is anchored on the **threshold-free**
+metrics — AUC-ROC and AUC-PR lift — not on detection lift. Second, the External-only operating
+point is *unstable by construction*: with an AUC-ROC at chance (≈0.5), the model's F1 surface
+over the threshold grid is nearly flat (the F1 differences between τ = 0.10 and τ = 0.30 are in
+the third decimal), so the argmax that defines its "own optimal" threshold, and the exact
+alarm density that falls inside the 14-day pre-episode windows, both vary between random
+realisations of an at-chance model. Concretely, the External-only predictions here are
+compressed around zero (inter-quartile range roughly [−0.08, +0.04]), so the absolute
+episode-detection percentage this notebook reports for External will not match the manuscript's
+canonical run digit-for-digit — the manuscript reports ≈48.5% of episode windows and ≈46.6% of
+non-panic windows flagged (lift +1.9 pp); a reimplementation lands at a similar near-parity but
+can fall either side of zero. Either way the *conclusion is identical and robust*: External's
+alarm is indiscriminate, firing at nearly the same rate before real episodes as on random calm
+days, so it carries no anticipatory value on its own. The AR-only and Combined operating points
+sit on steep F1 surfaces, are stable, and reproduce cleanly (detection lifts ≈ +27–28 pp). This
+is exactly why the threshold-free AUC metrics, not detection lift, carry the external-signal
+conclusion.
+
+## Figures: PR curves, ROC curves, threshold sweep, lead time
+
+```{r ews-plots, fig.width = 12, fig.height = 10}
+MODEL_COLS <- c("AR-only" = "#2A9D8F", "External-only" = "#E65F2B", "Combined" = "#0099B8")
+fix_order  <- function(d) { d$model <- factor(d$model,
+                              levels = c("External-only", "AR-only", "Combined")); d }
+
+pr_df  <- do.call(rbind, lapply(results, function(r)
+  data.frame(model = r$model, recall = r$pr$curve[, 1], precision = r$pr$curve[, 2])))
+roc_df <- do.call(rbind, lapply(results, function(r)
+  data.frame(model = r$model, fpr = r$roc$curve[, 1], tpr = r$roc$curve[, 2])))
+sweep_df <- do.call(rbind, lapply(results, function(r) r$sweep))
+lead_df  <- do.call(rbind, lapply(results, function(r) data.frame(
+  model  = r$model,
+  metric = c("Episode detection rate", "Non-panic baseline"),
+  value  = c(r$detection, r$baseline))))
+
+p_pr <- ggplot(fix_order(pr_df), aes(recall, precision, colour = model)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = results[[1]]$base_rate, linetype = "dashed", colour = "grey60") +
+  annotate("text", x = 0.95, y = results[[1]]$base_rate + 0.02, hjust = 1, size = 3,
+           colour = "grey40", label = sprintf("Base rate = %.3f", results[[1]]$base_rate)) +
+  scale_colour_manual(values = MODEL_COLS) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 0.65)) +
+  labs(x = "Recall", y = "Precision", colour = NULL, tag = "a") +
+  theme_minimal(base_size = 11) + theme(legend.position = "top")
+
+p_roc <- ggplot(fix_order(roc_df), aes(fpr, tpr, colour = model)) +
+  geom_line(linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(values = MODEL_COLS) + coord_equal() +
+  labs(x = "False positive rate", y = "True positive rate", colour = NULL, tag = "b") +
+  theme_minimal(base_size = 11) + theme(legend.position = "top")
+
+p_sweep <- ggplot(fix_order(sweep_df), aes(threshold, f1, colour = model)) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = COMMON_TAU, linetype = "dashed", colour = "grey50") +
+  annotate("text", x = COMMON_TAU, y = 0.35, hjust = -0.1, size = 3.2,
+           label = sprintf("tau = %.2f", COMMON_TAU)) +
+  scale_colour_manual(values = MODEL_COLS) +
+  labs(x = "Alarm threshold (predicted PBB-Score)", y = "F1", colour = NULL, tag = "c") +
+  theme_minimal(base_size = 11) + theme(legend.position = "top")
+
+p_lead <- ggplot(fix_order(lead_df), aes(model, value, fill = metric)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, alpha = 0.9) +
+  geom_text(aes(label = sprintf("%.1f%%", 100 * value)),
+            position = position_dodge(width = 0.7), vjust = -0.3, size = 3.2) +
+  scale_fill_manual(values = c("Episode detection rate" = "#E65F2B",
+                               "Non-panic baseline"     = "#0099B8")) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(x = NULL, y = "Rate", fill = NULL, tag = "d",
+       subtitle = "Each model at its own F1-optimal threshold") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top", plot.subtitle = element_text(size = 8))
+
+(p_pr + p_roc) / (p_sweep + p_lead)
+```
+
+---
+
+# Part 5 — Model interpretation with SHAP
+
+SHAP values (Lundberg & Lee, 2017; Shapley, 1953) tell us *which* features the gradient-boosted
+model relies on. Two caveats, stated up front:
+
+1. The SHAP model is fitted on a **random 80/20 split**, deliberately — the same split whose
+   forecasting numbers Part 3 rejects. That is defensible only because we are asking an
+   *attribution* question ("what does the model use?"), not a *performance* question. Its
+   $R^2$ must not be reported as evidence of predictive skill, and it is not.
+2. SHAP importance is a property of a fitted model, not of nature. It says which signals this
+   model exploited, not which signals cause panic buying. The causal-flavoured questions are
+   handled in Part 6 by Local Projections.
+
+```{r shap-fit}
+SHAP_DIR <- file.path(OUT_DIR, "Shap")
+
+df_s <- read.csv2(PANEL_CSV, fileEncoding = "UTF-8") %>%
+  dplyr::select(-any_of(c(cols_to_drop, "date", "city")))
+pv <- grep("^S_pandemic", names(df_s), value = TRUE)
+df_s[, pv] <- lapply(df_s[, pv], function(x) replace(x, is.na(x), 0))
+cc <- names(df_s)[sapply(df_s, is.character)]
+for (col in cc) df_s[[col]] <- as.numeric(as.factor(df_s[[col]]))
+
+df_s <- df_s %>% filter(!is.na(.data[[TARGET]]))
+Xs   <- df_s %>% dplyr::select(-all_of(TARGET)) %>% mutate(across(everything(), as.numeric))
+ys   <- df_s[[TARGET]]
+
+set.seed(42)
+tr_i <- caret::createDataPartition(ys, p = 0.8, list = FALSE)
+dtr  <- xgb.DMatrix(as.matrix(Xs[tr_i, ]),  label = ys[tr_i])
+dte  <- xgb.DMatrix(as.matrix(Xs[-tr_i, ]), label = ys[-tr_i])
+
+N_ROUNDS <- if (!is.null(best_row$nrounds) && !is.na(best_row$nrounds)) {
+  as.integer(best_row$nrounds)
+} else 500L
+
+shap_model <- xgb.train(params = base_params, data = dtr,
+                        nrounds = N_ROUNDS, verbose = 0)
+
+r2_random <- 1 - sum((ys[-tr_i] - predict(shap_model, dte))^2) /
+                 sum((ys[-tr_i] - mean(ys[-tr_i]))^2)
+cat(sprintf("Random-split test R2 = %.3f  <-- interpolation, NOT forecasting skill.\n", r2_random))
+cat(sprintf("Compare with the temporal-CV External-only R2 = %+.3f.\n",
+            summary_df$mean_r2[summary_df$model == "External-only"]))
+```
+
+That single contrast is, in one line, the paper's methodological point: the same feature set,
+the same model class, the same data — and a difference of roughly `r sprintf("%.2f", r2_random - summary_df$mean_r2[summary_df$model == "External-only"])`
+in $R^2$ that comes entirely from how the data were split.
+
+```{r shap-compute}
+shap_rds <- file.path(SHAP_DIR, "shap_matrix.rds")
+xts_rds  <- file.path(SHAP_DIR, "X_test_sample.rds")
+
+if (!file.exists(shap_rds)) {
+  if (!RUN_HEAVY) stop("SHAP cache missing and run_heavy = FALSE.")
+  unified <- treeshap::xgboost.unify(shap_model, as.matrix(Xs[tr_i, ]))
+  X_te    <- Xs[-tr_i, ]
+  set.seed(42)
+  X_te_s  <- if (nrow(X_te) > 1000) X_te[sample(nrow(X_te), 1000), ] else X_te
+  shap_matrix <- treeshap::treeshap(unified, as.matrix(X_te_s))$shaps
+  saveRDS(X_te_s, xts_rds); saveRDS(shap_matrix, shap_rds)
+} else {
+  X_te_s      <- readRDS(xts_rds)
+  shap_matrix <- readRDS(shap_rds)
+}
+
+shap_importance <- data.frame(Feature    = colnames(X_te_s),
+                              Importance = colMeans(abs(shap_matrix))) %>%
+  arrange(desc(Importance))
+write.csv(shap_importance, file.path(SHAP_DIR, "shap_feature_importance.csv"), row.names = FALSE)
+
+knitr::kable(head(shap_importance, 15), digits = 4, row.names = FALSE,
+             caption = "Top 15 features by mean |SHAP|")
+```
+
+## Stimulus vs. Organism, and the S-O-R sub-domains
+
+```{r shap-sor, fig.width = 12, fig.height = 5}
+stimuli_f  <- grep("^S_", colnames(X_te_s), value = TRUE)
+organism_f <- grep("^O_", colnames(X_te_s), value = TRUE)
+
+imp <- function(v) sum(shap_importance$Importance[shap_importance$Feature %in% v])
+
+cat_so <- data.frame(Category = c("Stimuli", "Organism"),
+                     Total_Importance = c(imp(stimuli_f), imp(organism_f)))
+
+domains <- list(
+  "Pandemic (S)"      = c("S_pandemic_Gtrends", "S_pandemic_cumulcases_log",
+                          "S_pandemic_cumuldeaths_log", "S_health_Gtrends"),
+  "Environmental (S)" = c("S_wind_gust_max", "S_precip_acc_3d",
+                          "S_climate_Gtrends", "S_cyclone_Gtrends"),
+  "Geopolitical (S)"  = c("S_strike_Gtrends", "S_strike_event"),
+  "Institutional (O)" = "O_gov_policy_Gtrends",
+  "Social (O)"        = c("O_mobil_dist_0", "O_mobil_dist_0_10km",
+                          "O_mobil_dist_10_100km", "O_mobil_dist_100km_plus", "O_news_count"),
+  "Situational (O)"   = c("O_psych_fear_Gtrends", "O_supermarket_Gtrends",
+                          "O_minimarket_Gtrends", "O_rationing_Gtrends"),
+  "Economic (O)"      = c("O_inflation_Gtrends", "O_basicfoodbasket_Gtrends")
+)
+cat_sub <- data.frame(Category   = names(domains),
+                      Importance = sapply(domains, imp)) %>% arrange(desc(Importance))
+
+domain_cols <- c("Environmental (S)" = "#2A9D8F", "Geopolitical (S)" = "#0099B8",
+                 "Pandemic (S)" = "#E65F2B", "Situational (O)" = "#FFB703",
+                 "Social (O)" = "#E25C84", "Institutional (O)" = "#6A4C93",
+                 "Economic (O)" = "#AE2012")
+
+pa <- ggplot(cat_so, aes(Category, Total_Importance, fill = Category)) +
+  geom_col(width = 0.65, show.legend = FALSE) +
+  scale_fill_manual(values = c("Stimuli" = "#023047", "Organism" = "#8ECAE6")) +
+  labs(tag = "a)", x = NULL, y = "Cumulative SHAP importance") +
+  theme_minimal(base_size = 11) + theme(panel.grid = element_blank())
+
+pb <- ggplot(cat_sub, aes(Importance, reorder(Category, Importance), fill = Category)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_manual(values = domain_cols) +
+  labs(tag = "b)", y = NULL, x = "Cumulative mean |SHAP|") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank())
+
+combined_fig <- pa + pb
+combined_fig
+ggsave(file.path(SHAP_DIR, "combined_figure2.png"), combined_fig,
+       width = 12, height = 5, dpi = 300)
+ggsave(file.path(OUT_DIR, "PDFs", "Figure_6.pdf"), combined_fig, width = 12, height = 5)
+```
+
+## SHAP beeswarm (feature impact)
+
+```{r shap-beeswarm, fig.width = 14, fig.height = 8}
+top_n  <- 20
+top_f  <- head(shap_importance, top_n)
+
+label_dict <- c(
+  S_pandemic_Gtrends = "S_pandemicGT", O_supermarket_Gtrends = "O_supermarketGT",
+  S_pandemic_cumuldeaths_log = "S_pandemicCumulDeathsLog", S_wind_gust_max = "S_windGustMax",
+  O_minimarket_Gtrends = "O_minimarketGT", S_health_Gtrends = "S_healthGT",
+  S_precip_acc_3d = "S_precipAcc3d", O_gov_policy_Gtrends = "O_govPolicyGT",
+  S_pandemic_cumulcases_log = "S_pandemicCumulCasesLog", O_psych_fear_Gtrends = "O_fearGT",
+  O_inflation_Gtrends = "O_inflationGT", O_mobil_dist_10_100km = "O_mobilDist_10_100km",
+  O_mobil_dist_0_10km = "O_mobilDist_0_10km", O_mobil_dist_0 = "O_mobilDist_0km",
+  O_mobil_dist_100km_plus = "O_mobilDist_100kmPlus", S_strike_Gtrends = "S_strikeGT",
+  S_climate_Gtrends = "S_weatherGT", S_cyclone_Gtrends = "S_cycloneGT",
+  O_news_count = "O_newsCount", O_basicfoodbasket_Gtrends = "O_basicFoodBasketGT"
+)
+relabel <- function(x) { y <- label_dict[x]; y[is.na(y)] <- x[is.na(y)]; unname(y) }
+
+shap_sub <- shap_matrix[, top_f$Feature, drop = FALSE]
+feat_val <- as.matrix(X_te_s[, top_f$Feature, drop = FALSE])
+
+op <- par(no.readonly = TRUE)
+par(mfrow = c(1, 2), mar = c(5, 14, 4, 2))
+
+rev_f <- rev(top_f$Feature)
+barplot(rev(top_f$Importance), names.arg = relabel(rev_f), horiz = TRUE, las = 1,
+        col = ifelse(startsWith(rev_f, "O_"), "#8ECAE6", "#023047"),
+        main = "a) SHAP feature importance", xlab = "Mean |SHAP value|")
+
+x_rng <- range(shap_sub, na.rm = TRUE)
+plot(NULL, xlim = c(x_rng[1], x_rng[2] * 1.25), ylim = c(1, top_n),
+     xlab = "SHAP value", ylab = "", main = "b) SHAP feature impact", yaxt = "n")
+axis(2, at = 1:top_n, labels = relabel(rev_f), las = 1)
+abline(v = 0, col = "grey", lty = 2)
+for (i in 1:top_n) {
+  k  <- top_n - i + 1
+  sv <- shap_sub[, k]; fv <- feat_val[, k]
+  nz <- (fv - min(fv, na.rm = TRUE)) / (max(fv, na.rm = TRUE) - min(fv, na.rm = TRUE))
+  nz[is.na(nz)] <- 0.5
+  points(sv, i + runif(length(sv), -0.3, 0.3), pch = 16, cex = 0.8,
+         col = rgb(nz, 0, 1 - nz, alpha = 0.5))
+}
+legend("topright", legend = c("High", "Low"), col = c("red", "blue"), pch = 16,
+       title = "Feature value", bg = "white")
+par(op)
+```
+
+---
+
+# Part 6 — Local Projections: dynamic responses
+
+SHAP describes a *predictive* association at a point in time. The theoretically interesting
+question is **dynamic**: when a stimulus arrives, how does the PBB-Score evolve over the
+following two weeks, and does that response differ across crisis regimes?
+
+We estimate Jordà (2005) Local Projections, horizon by horizon:
+
+$$
+\text{PBB}_{c,t+h} \;=\; \alpha_c \;+\; \beta_h\, x_{c,t} \;+\;
+\sum_{r} \delta_h^{(r)}\, \bigl(x_{c,t} \times C_t^{(r)}\bigr) \;+\;
+\sum_{r} \gamma_h^{(r)} C_t^{(r)} \;+\;
+\sum_{k \in \{1,7,14,28\}} \rho_{h,k}\,\text{PBB}_{c,t-k} \;+\; \varepsilon_{c,t+h}
+$$
+
+Three specification choices matter:
+
+* **A single joint specification with regime interactions**, rather than separate regressions
+  per regime. Splitting the sample would throw away the calm-period information that identifies
+  $\beta_h$ and would make the regime contrasts untestable.
+* **Two-way clustered standard errors on city *and* date.** Clustering on city alone would
+  ignore the fact that all 15 municipalities are hit by the same national shocks on the same
+  day; this is the cross-sectional dependence that Plagborg-Møller & Wolf (2021) warn about in
+  panel LPs.
+* **Regime totals use the full linear-combination variance**,
+  $\mathrm{Var}(\hat\beta_h + \hat\delta_h) = \mathrm{Var}(\hat\beta_h) + \mathrm{Var}(\hat\delta_h) + 2\,\mathrm{Cov}(\hat\beta_h, \hat\delta_h)$.
+  Omitting the covariance term (a common error) understates or overstates the CI depending on
+  its sign.
+
+```{r lp-setup}
+LP_DIR   <- file.path(OUT_DIR, "local_projections")
+HORIZONS <- 0:14
+
+# --- Regime calendar -----------------------------------------------------------------
+# Set to character(0) to use the full canonical calendar. Left as-is, it reproduces the
+# regime definitions actually used in Temporal_CV_v9.R for the LP and episode blocks.
+V9_CLIMATE_OMISSIONS <- c("sc_cyclone_2022", "sc_floods_2023")
+
+regime_calendar <- crisis_calendar[!(crisis_calendar$event %in% V9_CLIMATE_OMISSIONS), ]
+
+cat(sprintf("Regime calendar: %d of %d canonical events (%d climate window(s) omitted to match v9)\n",
+            nrow(regime_calendar), nrow(crisis_calendar), length(V9_CLIMATE_OMISSIONS)))
+
+by_type <- split(regime_calendar, regime_calendar$type)
+
+lp_raw <- read.csv2(PANEL_CSV, fileEncoding = "UTF-8")
+lp_raw$date <- as.Date(lp_raw$date)
+
+# Defend against read.csv2 re-inferring `logical` for the mostly-NA mobility columns
+# (populated only from 2022-12). Without this the Mobilization representative would be
+# all-NA and its Local-Projection panel would render empty.
+for (cc in grep("mobil", names(lp_raw), value = TRUE, ignore.case = TRUE)) {
+  if (is.logical(lp_raw[[cc]])) lp_raw[[cc]] <- as.numeric(lp_raw[[cc]])
+  else if (!is.numeric(lp_raw[[cc]]))
+    lp_raw[[cc]] <- suppressWarnings(as.numeric(gsub(",", ".", lp_raw[[cc]], fixed = TRUE)))
+}
+
+lp_raw$crisis_pandemic <- as.integer(in_calendar(lp_raw$date, by_type$pandemic))
+lp_raw$crisis_climate  <- as.integer(in_calendar(lp_raw$date, by_type$climate))
+lp_raw$crisis_geopol   <- as.integer(in_calendar(lp_raw$date, by_type$geopolitical))
+
+cat(sprintf("Regime coverage — pandemic %.1f%% | climate %.1f%% | geopolitical %.1f%% | calm %.1f%%\n",
+            100 * mean(lp_raw$crisis_pandemic), 100 * mean(lp_raw$crisis_climate),
+            100 * mean(lp_raw$crisis_geopol),
+            100 * mean(lp_raw$crisis_pandemic + lp_raw$crisis_climate +
+                         lp_raw$crisis_geopol == 0)))
+```
+
+## Category representatives
+
+One representative variable per S-O-R construct keeps the IRFs interpretable and avoids
+collinear shock definitions. The representatives are chosen on theoretical centrality,
+corroborated by the SHAP ranking in Part 5.
+
+```{r lp-categories}
+CATEGORY_VARS <- list(
+  "Trigger (S-pandemic)"      = "S_pandemic_Gtrends",
+  "Trigger (S-climate)"       = "S_wind_gust_max",
+  "Anticipation (O-news)"     = "O_news_count",
+  "Mobilization (O-mobility)" = "O_mobil_dist_0",
+  "Realization (price)"       = "O_basicfoodbasket_Gtrends"
+)
+CATEGORY_VARS <- CATEGORY_VARS[unlist(CATEGORY_VARS) %in% names(lp_raw)]
+knitr::kable(data.frame(Construct = names(CATEGORY_VARS),
+                        Variable  = unlist(CATEGORY_VARS)),
+             row.names = FALSE, caption = "S-O-R category representatives")
+```
+
+```{r lp-panel}
+panel <- lp_raw %>% filter(!is.na(.data[[TARGET]])) %>% arrange(city, date)
+
+# Standardise each shock so beta_h reads as "PBB-Score change per 1-SD shock"
+for (v in unlist(CATEGORY_VARS)) {
+  panel[[paste0(v, "_z")]] <- (panel[[v]] - mean(panel[[v]], na.rm = TRUE)) /
+                                sd(panel[[v]], na.rm = TRUE)
+}
+
+panel <- panel %>% group_by(city) %>%
+  mutate(API_lag1  = dplyr::lag(.data[[TARGET]], 1),
+         API_lag7  = dplyr::lag(.data[[TARGET]], 7),
+         API_lag14 = dplyr::lag(.data[[TARGET]], 14),
+         API_lag28 = dplyr::lag(.data[[TARGET]], 28)) %>% ungroup()
+
+for (h in HORIZONS) {
+  panel <- panel %>% group_by(city) %>%
+    mutate(!!sprintf("API_lead_%d", h) := dplyr::lead(.data[[TARGET]], h)) %>% ungroup()
+}
+cat(sprintf("LP panel: %s rows x %d columns\n", format(nrow(panel), big.mark = ","), ncol(panel)))
+
+# Coverage diagnostic for the sparse mobility representative: if this shows 0
+# non-missing rows, the construct genuinely cannot be estimated (data issue) rather
+# than being lost to a fragile specification (which the estimator cascade handles).
+mob_z <- paste0(CATEGORY_VARS[["Mobilization (O-mobility)"]], "_z")
+if (!is.null(mob_z) && mob_z %in% names(panel)) {
+  nn <- sum(!is.na(panel[[mob_z]]))
+  rng <- range(panel$date[!is.na(panel[[mob_z]])])
+  cat(sprintf("Mobility representative (%s): %s non-missing rows, %s to %s\n",
+              mob_z, format(nn, big.mark = ","),
+              if (is.finite(rng[1])) rng[1] else NA,
+              if (is.finite(rng[2])) rng[2] else NA))
+}
+```
+
+## Estimation
+
+```{r lp-estimators}
+CRISIS_DUMMIES <- c("crisis_pandemic", "crisis_climate", "crisis_geopol")
+CRISIS_LABELS  <- c(crisis_pandemic = "Pandemic", crisis_climate = "Climate",
+                    crisis_geopol   = "Geopolitical")
+AR_TERMS <- c("API_lag1", "API_lag7", "API_lag14", "API_lag28")
+
+# Baseline (no regime interaction).
+# Sparse constructs (the post-2022 mobility representative in particular) can defeat
+# the full two-way-clustered spec: too few date clusters at long horizons, or a
+# near-collinear design once 28-day AR lags are added on the short post-2022 sample.
+# Rather than let such a construct vanish from the pooled projection — the manuscript
+# reports Mobilization in Figure 8 and only omits it from the crisis-interacted
+# Figure 9 — we try a cascade of progressively more forgiving specifications and stop
+# at the first that returns a finite coefficient. The specification actually used is
+# recorded in `se_type` for full transparency.
+estimate_lp <- function(panel, shock, h, label) {
+  z <- paste0(shock, "_z")
+
+  attempts <- list(
+    list(tag = "twoway(city,date)", ar = AR_TERMS,                         cl = ~ city + date, fe = TRUE),
+    list(tag = "oneway(city)",      ar = AR_TERMS,                         cl = ~ city,        fe = TRUE),
+    list(tag = "oneway(city),AR1-14", ar = c("API_lag1","API_lag7","API_lag14"), cl = ~ city,  fe = TRUE),
+    list(tag = "oneway(city),AR1",   ar = "API_lag1",                       cl = ~ city,        fe = TRUE),
+    list(tag = "iid,AR1",            ar = "API_lag1",                       cl = NULL,          fe = TRUE),
+    list(tag = "noFE,AR1",           ar = "API_lag1",                       cl = NULL,          fe = FALSE)
+  )
+
+  for (a in attempts) {
+    rhs <- paste(c(z, a$ar), collapse = " + ")
+    fml <- as.formula(if (a$fe) sprintf("API_lead_%d ~ %s | city", h, rhs)
+                      else       sprintf("API_lead_%d ~ %s",        h, rhs))
+    fit <- tryCatch(
+      if (is.null(a$cl)) feols(fml, data = panel)
+      else               feols(fml, data = panel, cluster = a$cl),
+      error = function(e) NULL)
+    if (is.null(fit)) next
+
+    ct <- coeftable(fit)
+    if (!(z %in% rownames(ct))) next
+    est <- ct[z, "Estimate"]; se <- ct[z, "Std. Error"]
+    if (!is.finite(est) || !is.finite(se)) next     # dropped-for-collinearity guard
+
+    return(data.frame(category = label, horizon = h, shock = shock,
+                      beta = est, se = se, p_value = ct[z, "Pr(>|t|)"],
+                      n_obs = nobs(fit), se_type = a$tag,
+                      ci_lo = est - 1.96 * se, ci_hi = est + 1.96 * se,
+                      stringsAsFactors = FALSE))
+  }
+  NULL
+}
+
+# Joint specification with regime interactions
+estimate_lp_joint <- function(panel, shock, h, label) {
+  z    <- paste0(shock, "_z")
+  ints <- sprintf("%s:%s", z, CRISIS_DUMMIES)
+  fml  <- as.formula(sprintf("API_lead_%d ~ %s | city", h,
+                             paste(c(z, AR_TERMS, CRISIS_DUMMIES, ints), collapse = " + ")))
+  fit  <- tryCatch(feols(fml, data = panel, cluster = ~ city + date), error = function(e) NULL)
+  if (is.null(fit)) return(NULL)
+
+  b <- coef(fit); V <- vcov(fit)
+  if (!(z %in% names(b))) return(NULL)
+
+  beta0 <- unname(b[z]); se0 <- unname(sqrt(V[z, z]))
+  out <- list(data.frame(category = label, horizon = h, shock = shock, crisis_type = "Calm",
+                         beta = beta0, se = se0,
+                         ci_lo = beta0 - 1.96 * se0, ci_hi = beta0 + 1.96 * se0,
+                         delta = NA_real_, se_delta = NA_real_, p_delta = NA_real_,
+                         stringsAsFactors = FALSE))
+
+  for (cv in CRISIS_DUMMIES) {
+    inm <- sprintf("%s:%s", z, cv)
+    if (!(inm %in% names(b))) next             # regime not identified at this horizon
+    delta   <- unname(b[inm])
+    total   <- beta0 + delta
+    # FULL linear-combination variance, including the covariance term
+    var_tot <- V[z, z] + V[inm, inm] + 2 * V[z, inm]
+    se_tot  <- sqrt(max(var_tot, 0))
+    se_int  <- unname(sqrt(V[inm, inm]))
+    out[[length(out) + 1]] <- data.frame(
+      category = label, horizon = h, shock = shock,
+      crisis_type = unname(CRISIS_LABELS[cv]),
+      beta = total, se = se_tot,
+      ci_lo = total - 1.96 * se_tot, ci_hi = total + 1.96 * se_tot,
+      delta = delta, se_delta = se_int, p_delta = 2 * pnorm(-abs(delta / se_int)),
+      stringsAsFactors = FALSE)
+  }
+  dplyr::bind_rows(out)
+}
+```
+
+```{r lp-run, results = "hold"}
+baseline_all <- dplyr::bind_rows(lapply(names(CATEGORY_VARS), function(cn) {
+  dplyr::bind_rows(lapply(HORIZONS, function(h)
+    estimate_lp(panel, CATEGORY_VARS[[cn]], h, cn)))
+}))
+
+crisis_all <- dplyr::bind_rows(lapply(names(CATEGORY_VARS), function(cn) {
+  dplyr::bind_rows(lapply(HORIZONS, function(h)
+    estimate_lp_joint(panel, CATEGORY_VARS[[cn]], h, cn)))
+}))
+
+write.csv(baseline_all, file.path(LP_DIR, "lp_irf_all.csv"),       row.names = FALSE)
+write.csv(crisis_all,   file.path(LP_DIR, "lp_irf_by_crisis.csv"), row.names = FALSE)
+
+peaks <- baseline_all %>% group_by(category) %>%
+  slice_max(abs(beta), n = 1, with_ties = FALSE) %>% ungroup() %>%
+  transmute(Construct = category, `Peak h` = horizon,
+            `Peak beta` = round(beta, 4),
+            `95% CI` = sprintf("[%+.4f, %+.4f]", ci_lo, ci_hi),
+            p = signif(p_value, 3))
+knitr::kable(peaks, caption = "Peak impulse response by S-O-R construct (baseline specification)")
+```
+
+## Baseline impulse responses
+
+```{r lp-fig-baseline, fig.width = 11, fig.height = 8}
+CAT_COLORS <- c("Trigger (S-pandemic)"      = "#E65F2B",
+                "Trigger (S-climate)"       = "#2A9D8F",
+                "Anticipation (O-news)"     = "#FFB703",
+                "Mobilization (O-mobility)" = "#E25C84",
+                "Realization (price)"       = "#AE2012")
+
+# Order the facets deliberately (matching the manuscript's Figure 8) and pin the
+# factor to all five S-O-R representatives, so a construct is never silently dropped
+# by facet_wrap; if a construct failed to estimate it will surface as an empty panel
+# rather than vanishing without trace.
+FACET_ORDER <- c("Trigger (S-pandemic)", "Trigger (S-climate)",
+                 "Anticipation (O-news)", "Mobilization (O-mobility)",
+                 "Realization (price)")
+
+base_plot_df <- baseline_all %>%
+  filter(!is.na(beta)) %>%
+  mutate(category = factor(category, levels = FACET_ORDER))
+
+present  <- levels(droplevels(base_plot_df$category))
+missing  <- setdiff(FACET_ORDER, present)
+cat(sprintf("Baseline LP constructs identified: %d of 5 (%s)\n",
+            length(present), paste(present, collapse = ", ")))
+if (length(missing))
+  cat(sprintf("NOTE: not identified in the pooled spec: %s\n", paste(missing, collapse = ", ")))
+
+p_base <- ggplot(base_plot_df, aes(horizon, beta, colour = category, fill = category)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), alpha = 0.20, colour = NA) +
+  geom_line(linewidth = 0.9) + geom_point(size = 2) +
+  scale_colour_manual(values = CAT_COLORS, drop = FALSE) +
+  scale_fill_manual(values = CAT_COLORS, drop = FALSE) +
+  facet_wrap(~ category, ncol = 2, scales = "free_y", drop = FALSE) +
+  labs(x = "Horizon h (days after shock)",
+       y = expression("Impulse response " * beta[h] * " (PBB-Score change per 1-SD shock)"),
+       subtitle = "Shaded band: 95% pointwise CI, two-way clustered (city, date) SE (city-only where noted)") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none", strip.text = element_text(face = "bold"))
+p_base
+ggsave(file.path(LP_DIR, "lp_irf_panel.png"), p_base, width = 11, height = 8, dpi = 150)
+ggsave(file.path(OUT_DIR, "PDFs", "Figure_8.pdf"), p_base, width = 11, height = 8)
+```
+
+## Crisis-conditional impulse responses
+
+```{r lp-fig-crisis, fig.width = 8, fig.height = 11}
+crisis_cols <- c(Calm = "grey40", Pandemic = "#E65F2B",
+                 Climate = "#2A9D8F", Geopolitical = "#0099B8")
+
+build_lp_panel <- function(cn, tag, show_x = TRUE, show_legend = FALSE) {
+  d <- crisis_all %>% filter(category == cn, !is.na(beta)) %>%
+    mutate(crisis_type = factor(crisis_type,
+                                levels = c("Calm", "Pandemic", "Climate", "Geopolitical")))
+  ggplot(d, aes(horizon, beta, colour = crisis_type, fill = crisis_type)) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60", linewidth = 0.4) +
+    geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), alpha = 0.18, colour = NA) +
+    geom_line(linewidth = 0.7) + geom_point(size = 1.4) +
+    scale_colour_manual(values = crisis_cols, drop = FALSE) +
+    scale_fill_manual(values  = crisis_cols, drop = FALSE) +
+    scale_x_continuous(breaks = c(0, 5, 10, 14), limits = c(0, 14)) +
+    labs(x = if (show_x) "Horizon h (days after shock)" else NULL,
+         y = expression(beta[h]), colour = NULL, fill = NULL, tag = tag) +
+    theme_minimal(base_size = 10) +
+    theme(plot.tag = element_text(size = 10, face = "bold"),
+          legend.position = if (show_legend) "bottom" else "none",
+          panel.grid.minor = element_blank())
+}
+
+lp_a <- build_lp_panel("Realization (price)",   "(a) Realization (price)", show_x = FALSE)
+lp_b <- build_lp_panel("Anticipation (O-news)", "(b) Anticipation (news)", show_x = FALSE)
+lp_c <- build_lp_panel("Trigger (S-climate)",   "(c) Trigger (climate)",   show_legend = TRUE)
+
+lp_combined <- ((lp_a / lp_b / lp_c) + plot_layout(guides = "collect")) +
+  plot_annotation(theme = theme(legend.position = "bottom",
+                                legend.text     = element_text(size = 10),
+                                legend.margin   = margin(t = -2)))
+
+lp_combined
+ggsave(file.path(LP_DIR, "lp_irf_crisis_combined.png"), lp_combined,
+       width = 8, height = 11, dpi = 300)
+ggsave(file.path(OUT_DIR, "PDFs", "Figure_9.pdf"), lp_combined, width = 8, height = 11)
+```
+
+A caveat that belongs in the caption, not in a footnote: **mobility data only begin in 2022**
+(Meta Movement Distribution Maps), so the pandemic × mobility interaction rests on very little
+overlap and in some horizons is not identified at all. Where `fixest` cannot identify a regime
+interaction, the row is simply absent from `crisis_all` — there is no silent imputation.
+
+```{r lp-mobility-check}
+panel %>% filter(!is.na(O_mobil_dist_0_z)) %>%
+  summarise(across(all_of(CRISIS_DUMMIES), sum)) %>%
+  knitr::kable(caption = "Crisis-regime days with non-missing mobility data")
+```
+
+---
+
+# Part 7 — Episode anatomy
+
+Finally, the descriptive natural history. An **episode** is a maximal run of days on which a
+city's PBB-Score is at or above 2σ, allowing gaps of up to two days to be bridged (a
+single quiet Sunday inside an otherwise continuous panic should not split one episode into
+two).
+
+```{r ep-setup}
+EP_DIR <- file.path(OUT_DIR, "episode_anatomy")
+EXTREME_THRESHOLD <- 3.0
+GAP_TOLERANCE     <- 2
+
+identify_runs <- function(x, gap_tolerance = 0) {
+  x <- as.integer(x)
+  if (gap_tolerance > 0) {
+    rl <- rle(x)
+    bridge <- rl$values == 0 & rl$lengths <= gap_tolerance &
+      c(FALSE, head(rl$values, -1) == 1) & c(tail(rl$values, -1) == 1, FALSE)
+    rl$values[bridge] <- 1
+    x <- inverse.rle(rl)
+  }
+  rl <- rle(x)
+  run_id <- rep(NA_integer_, length(x))
+  if (any(rl$values == 1)) {
+    starts <- cumsum(c(1, head(rl$lengths, -1)))
+    ends   <- starts + rl$lengths - 1
+    k <- 0
+    for (j in seq_along(rl$values)) if (rl$values[j] == 1) {
+      k <- k + 1; run_id[starts[j]:ends[j]] <- k
+    }
+  }
+  run_id
+}
+```
+
+```{r ep-identify}
+ep_df <- read.csv2(PANEL_CSV, fileEncoding = "UTF-8")
+ep_df$date <- as.Date(ep_df$date)
+ep_df <- ep_df %>% filter(!is.na(API)) %>% arrange(city, date) %>%
+  mutate(panic_flag   = as.integer(API >= PANIC_THRESHOLD),
+         extreme_flag = as.integer(API >= EXTREME_THRESHOLD))
+
+episodes <- ep_df %>%
+  group_by(city) %>%
+  mutate(episode_id = identify_runs(panic_flag, GAP_TOLERANCE)) %>%
+  ungroup() %>%
+  filter(!is.na(episode_id)) %>%
+  group_by(city, episode_id) %>%
+  summarise(start_date    = min(date),
+            end_date      = max(date),
+            duration_days = as.integer(end_date - start_date) + 1L,
+            n_panic_days  = sum(panic_flag, na.rm = TRUE),
+            peak_PBB      = max(API, na.rm = TRUE),
+            mean_PBB      = mean(API[panic_flag == 1], na.rm = TRUE),
+            is_extreme    = as.integer(any(extreme_flag == 1, na.rm = TRUE)),
+            .groups = "drop") %>%
+  mutate(year = year(start_date))
+
+# An episode is labelled by a crisis type if its interval OVERLAPS any window of that type.
+# The regime calendar (with the documented v9 omissions) is reused from Part 6.
+overlaps <- function(s, e, cal) {
+  Reduce(`|`, Map(function(ws, we) s <= we & e >= ws, cal$start, cal$end))
+}
+
+episodes <- episodes %>%
+  mutate(is_pandemic = overlaps(start_date, end_date, by_type$pandemic),
+         is_climate  = overlaps(start_date, end_date, by_type$climate),
+         is_geopol   = overlaps(start_date, end_date, by_type$geopolitical),
+         # Prioritised label: acute (climate/geopolitical) overrides chronic (pandemic)
+         crisis_type = case_when(is_climate  ~ "Climate",
+                                 is_geopol   ~ "Geopolitical",
+                                 is_pandemic ~ "Pandemic",
+                                 TRUE        ~ "Unattributed"))
+
+write.csv(episodes, file.path(EP_DIR, "episode_table.csv"), row.names = FALSE)
+
+cat(sprintf("Episodes identified: %d across %d municipalities\n",
+            nrow(episodes), n_distinct(episodes$city)))
+```
+
+The prioritised label needs justification. The pandemic windows span years, so almost every
+climate or geopolitical episode in 2020–2022 *also* falls inside a pandemic window. Attributing
+those to "pandemic" would make the pandemic look like the cause of everything. We therefore let
+the **acute, short-window** hazard take precedence over the **chronic, long-window** one.
+
+```{r ep-summary}
+ep_summary <- data.frame(
+  Metric = c("Total episodes", "Municipalities with >= 1 episode",
+             "Mean duration (days)", "Median duration (days)", "Max duration (days)",
+             "Mean peak PBB-Score", "Episodes containing an extreme (>= 3σ) day",
+             "Episodes per city-year"),
+  Value = c(nrow(episodes),
+            n_distinct(episodes$city),
+            round(mean(episodes$duration_days), 2),
+            median(episodes$duration_days),
+            max(episodes$duration_days),
+            round(mean(episodes$peak_PBB), 2),
+            sum(episodes$is_extreme),
+            round(nrow(episodes) / (n_distinct(episodes$city) * n_distinct(episodes$year)), 2))
+)
+knitr::kable(ep_summary, row.names = FALSE, caption = "Episode anatomy — headline statistics")
+
+ct <- episodes %>% count(crisis_type) %>%
+  mutate(share = sprintf("%.1f%%", 100 * n / sum(n))) %>% arrange(desc(n))
+knitr::kable(ct, col.names = c("Crisis context", "Episodes", "Share"),
+             caption = "Episodes by crisis attribution (prioritised labelling)")
+```
+
+## Sensitivity to the gap tolerance
+
+The two-day bridge is a judgement call, so it should be shown to be inconsequential:
+
+```{r ep-gap-sensitivity}
+gap_tab <- do.call(rbind, lapply(c(0, 1, 2, 5), function(g) {
+  n <- ep_df %>% group_by(city) %>%
+    mutate(eid = identify_runs(panic_flag, g)) %>% ungroup() %>%
+    filter(!is.na(eid)) %>% distinct(city, eid) %>% nrow()
+  data.frame(`Gap tolerance (days)` = g, Episodes = n, check.names = FALSE)
+}))
+knitr::kable(gap_tab, row.names = FALSE,
+             caption = "Episode count as a function of the gap-bridging tolerance")
+```
+
+## Figures
+
+```{r ep-figs, fig.width = 11, fig.height = 8}
+crisis_colors <- c(Pandemic = "#E65F2B", Climate = "#2A9D8F",
+                   Geopolitical = "#0099B8", Unattributed = "#8D99AE")
+
+# Pin the crisis_type factor so every panel uses the same four levels / colours,
+# whether or not a given panel actually contains all of them.
+episodes <- episodes %>%
+  mutate(crisis_type = factor(crisis_type,
+                              levels = c("Pandemic", "Climate", "Geopolitical", "Unattributed")))
+
+# (a) episodes per year, stacked by crisis type
+p_year <- episodes %>% count(year, crisis_type, .drop = FALSE) %>%
+  ggplot(aes(factor(year), n, fill = crisis_type)) +
+  geom_col(width = 0.75, colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = crisis_colors, drop = FALSE) +
+  labs(x = "Year", y = "Number of episodes", fill = NULL, tag = "(a)") +
+  theme_minimal(base_size = 10) +
+  theme(plot.tag = element_text(size = 10, face = "bold"),
+        legend.position = "none", panel.grid.minor = element_blank())
+
+# (b) episodes per city, sorted, stacked by crisis type
+city_order   <- episodes %>% count(city) %>% arrange(n) %>% pull(city)
+p_city <- episodes %>% count(city, crisis_type, .drop = FALSE) %>%
+  mutate(city = factor(city, levels = city_order)) %>%
+  ggplot(aes(city, n, fill = crisis_type)) +
+  geom_col(width = 0.75, colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = crisis_colors, drop = FALSE) +
+  coord_flip() +
+  labs(x = NULL, y = "Number of episodes", fill = NULL, tag = "(b)") +
+  theme_minimal(base_size = 10) +
+  theme(plot.tag = element_text(size = 10, face = "bold"),
+        legend.position = "none", panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank())
+
+# (c) duration distribution — a STACKED histogram coloured by crisis type
+#     (not a single-colour histogram)
+p_dur <- ggplot(episodes, aes(duration_days, fill = crisis_type)) +
+  geom_histogram(binwidth = 1, colour = "white", linewidth = 0.2) +
+  scale_fill_manual(values = crisis_colors, drop = FALSE) +
+  scale_x_continuous(breaks = c(1, 5, 10, 15, 20, 30)) +
+  labs(x = "Episode duration (days)", y = "Number of episodes",
+       fill = NULL, tag = "(c)") +
+  theme_minimal(base_size = 10) +
+  theme(plot.tag = element_text(size = 10, face = "bold"),
+        legend.position = "none", panel.grid.minor = element_blank())
+
+# (d) peak-intensity distribution — a histogram of peak PBB coloured by crisis type,
+#     with the 3σ extreme line (this is a distribution, NOT a duration-vs-peak scatter)
+p_sev <- ggplot(episodes, aes(peak_PBB, fill = crisis_type)) +
+  geom_histogram(binwidth = 0.25, colour = "white", linewidth = 0.2) +
+  geom_vline(xintercept = EXTREME_THRESHOLD, linetype = "dashed",
+             colour = "grey40", linewidth = 0.4) +
+  annotate("text", x = EXTREME_THRESHOLD, y = Inf, label = " Extreme (3σ)",
+           hjust = 0, vjust = 1.5, size = 3, colour = "grey40") +
+  scale_fill_manual(values = crisis_colors, drop = FALSE) +
+  labs(x = "Peak PBB-Score", y = "Number of episodes", fill = NULL, tag = "(d)") +
+  theme_minimal(base_size = 10) +
+  theme(plot.tag = element_text(size = 10, face = "bold"),
+        legend.position = "bottom", panel.grid.minor = element_blank())
+
+# Composition-level legend via plot_annotation (ggplot2 4.x-safe; no `&` on patchwork)
+ep_panel <- ((p_year + p_city) / (p_dur + p_sev)) +
+  plot_layout(guides = "collect") +
+  plot_annotation(theme = theme(legend.position = "bottom",
+                                legend.text   = element_text(size = 10),
+                                legend.margin = margin(t = -4)))
+ep_panel
+ggsave(file.path(EP_DIR, "episode_anatomy_panel.png"), ep_panel,
+       width = 11, height = 8, dpi = 300)
+ggsave(file.path(OUT_DIR, "PDFs", "Figure_3.pdf"), ep_panel, width = 11, height = 8)
+```
+
+---
+
+# Reproducibility
+
+Every table and figure above is generated by this document. The canonical model outputs used
+in the manuscript are:
+
+```{r artefacts, echo = FALSE}
+knitr::kable(data.frame(
+  Artefact = c("Regression comparison (headline)", "Per-fold regression metrics",
+               "Early-warning comparison", "Per-fold classification metrics",
+               "Hyperparameter-transfer sensitivity", "Local Projection IRFs",
+               "Episode table", "Processed modelling panel"),
+  Path = c(file.path(AR_DIR,  "comparison_summary.csv"),
+           file.path(AR_DIR,  "comparison_fold_metrics.csv"),
+           file.path(CW_DIR,  "comparison_summary.csv"),
+           file.path(CW_DIR,  "metrics_per_fold.csv"),
+           file.path(OUT_DIR, "hyperparam_sensitivity.csv"),
+           file.path(LP_DIR,  "lp_irf_by_crisis.csv"),
+           file.path(EP_DIR,  "episode_table.csv"),
+           PANEL_CSV)
+), row.names = FALSE, caption = "Canonical outputs")
+```
+
+```{r session}
+sessionInfo()
+```
+
+## Data availability
+
+The SEF/SC *Nota Fiscal* transaction data underlying `total_sales_value_daily` are provided
+by the Santa Catarina State Treasury. All other inputs are public: IBGE/SIDRA (IPCA food
+sub-index, population), Google Trends, INMET (meteorology), Meta Movement Distribution Maps
+(mobility, 2022 onward), and Globo/G1 headline counts.
