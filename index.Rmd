@@ -94,9 +94,9 @@ checkout of the repository without editing code. **No `setwd()` is used**: `knit
 working directory to the folder containing this file.
 
 ```{r paths}
-DATA_DIR <- "0.Processed_data"#params$data_dir
-PROC_DIR <- "0.Processed_data"#params$proc_dir
-OUT_DIR  <- "improved_final"#params$out_dir
+DATA_DIR <- "data/input/"#params$data_dir
+PROC_DIR <- "data/input/"#params$proc_dir
+OUT_DIR  <- "data/analysis/"#params$out_dir
 
 for (d in c(PROC_DIR, OUT_DIR,
             file.path(OUT_DIR, "PDFs"),

@@ -19,6 +19,8 @@ setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
 rm(list = ls())
 
 #0.Starting point - adjust the data------
+#please note: this data is not shared, due to the data protection guidelines from the Santa Catarina State Treasury. Everything linked to
+#this not shared data is in the folder "data/input/"; Just jump to section 1. if you don't have access to the Santa Catarina State Treasury data.
 df_save <- read_excel("data/input/2_5_Final_data_Before_Time_modification_and_new_variables.xlsx")
 
 Final_data_Before_Time_modification <- df_save 
@@ -6212,7 +6214,7 @@ p <- ggplot(agg, aes(date)) +
 
 ggsave("data/output/SC_pandemic_waves.png", p, width = 13, height = 6.2, dpi = 200)
 
-# ==============================================================================
+#8. Figures 6 and 7-------
 # Self-contained recreation of:
 #   - shap_importance.png
 #   - shap_summary_detailed.png
@@ -6227,7 +6229,6 @@ ggsave("data/output/SC_pandemic_waves.png", p, width = 13, height = 6.2, dpi = 2
 #
 # Expensive steps (grid search, SHAP) are guarded by file.exists(): they run
 # once if their cache is missing, otherwise they are reloaded.
-# ==============================================================================
 
 suppressPackageStartupMessages({
   library(xgboost)
@@ -6544,9 +6545,7 @@ par(mfrow = c(1, 2))
 # Use exactly top 20 for both so the horizontal alignment matches perfectly
 top_n <- 20 
 
-# ---------------------------------------------------------
 # PANEL a) SHAP Feature Importance (Left)
-# ---------------------------------------------------------
 top_features <- head(shap_importance, top_n)
 rev_features <- rev(top_features$Feature)
 new_labels_importance <- relabel_features(rev_features)
@@ -6564,9 +6563,7 @@ barplot(rev(top_features$Importance),
         main = "a) SHAP Feature Importance", xlab = "Mean |SHAP value|",
         cex.main = 1.4, cex.names = 1.1, cex.lab = 1.2) # Scaled up text slightly
 
-# ---------------------------------------------------------
 # PANEL b) SHAP Feature Impact (Right)
-# ---------------------------------------------------------
 top_feature_names <- head(shap_importance$Feature, top_n)
 shap_subset       <- shap_matrix[, top_feature_names]
 feature_values    <- as.matrix(X_test_sample[, top_feature_names])
@@ -6621,9 +6618,7 @@ pdf(file.path("data/analysis/PDFs", "Figure_7.pdf"), width = 14.5, height = 8)
 # Set global layout: 1 row, 2 columns
 par(mfrow = c(1, 2))
 
-# ---------------------------------------------------------
 # PANEL a) SHAP Feature Importance (Left)
-# ---------------------------------------------------------
 par(mar = c(5, 14, 4, 2)) 
 barplot(rev(top_features$Importance), 
         names.arg = new_labels_importance,
@@ -6632,9 +6627,7 @@ barplot(rev(top_features$Importance),
         main = "a) SHAP Feature Importance", xlab = "Mean |SHAP value|",
         cex.main = 1.4, cex.names = 1.1, cex.lab = 1.2) 
 
-# ---------------------------------------------------------
 # PANEL b) SHAP Feature Impact (Right)
-# ---------------------------------------------------------
 par(mar = c(5, 14, 4, 2)) 
 plot(NULL, xlim = c(x_min, x_max_padded), ylim = c(1, top_n),
      xlab = "SHAP value", ylab = "", 
@@ -6788,3 +6781,5 @@ ggsave(file.path(output_dir, "combined_figure2.png"), combined_figure2,
 
 ggsave(file.path("data/analysis/PDFs", "Figure_6.pdf"),
        combined_figure2, width = 12, height = 5, device = "pdf")
+
+#end------
