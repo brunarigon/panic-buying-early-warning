@@ -4283,7 +4283,7 @@ p_baseline <- ggplot(baseline_all,
 ggsave(file.path(output_dir, "lp_irf_panel.png"), p_baseline,
        width = 11, height = 8, dpi = 150)
 
-ggsave(file.path("data/analysis/PDFs", "Figure_8.pdf"),
+ggsave(file.path("data/analysis/PDFs", "Figure_7.pdf"),
        p_baseline, width = 11, height = 8, device = "pdf")
 
 # --- Plot 2: Crisis-stratified IRFs, one figure per category ---
@@ -4458,7 +4458,7 @@ out_dir <- "data/analysis/local_projections/"
 ggsave(file.path(out_dir, "lp_irf_crisis_combined.png"),
        combined, width = 8, height = 11, dpi = 300)
 
-ggsave(file.path("data/analysis/PDFs", "Figure_9.pdf"),
+ggsave(file.path("data/analysis/PDFs", "Figure_8.pdf"),
        combined, width = 8, height = 11, device = "pdf")
 
 # ── 9. Final summary ─────────────────────────────────────────────────────────
@@ -6613,7 +6613,7 @@ dev.off()
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Open the PDF device (dimensions in inches)
-pdf(file.path("data/analysis/PDFs", "Figure_7.pdf"), width = 14.5, height = 8)
+pdf(file.path("data/analysis/PDFs", "Figure_Appendix_B.pdf"), width = 14.5, height = 8)
 
 # Set global layout: 1 row, 2 columns
 par(mfrow = c(1, 2))

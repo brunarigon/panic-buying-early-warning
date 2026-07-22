@@ -1,5 +1,5 @@
 "from","to","n"
-"Unattributed","Unattributed",652
+"Unattributed","Unattributed",648
 "Pandemic","Pandemic",321
 "Pandemic","Unattributed",39
 "Unattributed","Pandemic",38
@@ -7,7 +7,7 @@
 "Climate","Unattributed",16
 "Pandemic","Climate",16
 "Unattributed","Climate",16
-"Climate","Climate",4
+"Climate","Climate",3
 "Geopolitical","Pandemic",1
 "Geopolitical","Unattributed",1
 "Pandemic","Geopolitical",1
