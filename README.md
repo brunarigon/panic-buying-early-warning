@@ -83,10 +83,6 @@ The remainder of this README moves from high-level structure to technical detail
 ├── panic-buying-early-warning.Rproj
 ├── .gitignore                     # Ignores data/input/ (proprietary fiscal data)
 │
-├── media/                         # Figures used in this README
-│   ├── Retail_Panic_Buying_Strategy.png   # Visual abstract
-│   └── regions_of_the_study.png           # Study-region / mesoregion map
-│
 └── data/
     ├── input/                     # ⛔ NOT tracked by git — proprietary merged panels (see Data requirements)
     ├── Casos_Covid.xlsx           # ✅ Open epidemiological data (COVID-19 cases, SC)
