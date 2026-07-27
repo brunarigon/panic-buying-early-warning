@@ -138,30 +138,135 @@ The fiscal series is merged with the open external signals into a set of progres
 **Schema of the merged panel.** The panel is keyed by `city` × `date` (15 municipalities × daily, 2018–2025 ≈ 43,800 city-day rows). The **Response** is built from the proprietary fiscal series (`total_sales_value_daily`, normalized per capita by `population_2022`), while the predictors operationalize the seven S-O-R domains (prefixes `S_` = Stimulus, `O_` = Organism).
  
 **Variable dictionary (S-O-R operationalization).** The table below documents every variable, its search topic or definition, and its data source. It corresponds to the full variable list in Appendix A.2 of the manuscript. Google Trends topics are given in Brazilian Portuguese (English gloss in parentheses); PCA-aggregated indices bundle several correlated search topics into a single component.
- 
-| S-O-R | Domain | Variable | Description / search topics | Source |
-| --- | --- | --- | --- | --- |
-| **Stimulus (S)** | Environmental | `S_precipAcc` | 3-day accumulated precipitation | [INMET / BDMEP](https://bdmep.inmet.gov.br/) |
-| | | `S_windGustMax` | Daily maximum wind gust | [INMET / BDMEP](https://bdmep.inmet.gov.br/) |
-| | | `S_climateGT` | PCA index of topics: *previsão do tempo* (weather forecast), *defesa civil* (civil defense), *chuva* (rain), *inundação* (flood) | [Google Trends](https://trends.google.com/) |
-| | | `S_cycloneGT` | Topic: *ciclone* (cyclone) | [Google Trends](https://trends.google.com/) |
-| | Health | `S_pandemicCumulCasesLog` | Cumulative COVID-19 confirmed cases (log) | [Brasil.IO](https://brasil.io/dataset/covid19/caso_full/) |
-| | | `S_pandemicCumulDeathsLog` | Cumulative COVID-19 confirmed deaths (log) | [Brasil.IO](https://brasil.io/dataset/covid19/caso_full/) |
-| | | `S_pandemicGT` | Topic: *pandemia* (pandemic) | [Google Trends](https://trends.google.com/) |
-| | | `S_healthGT` | Topic: *saúde* (health) | [Google Trends](https://trends.google.com/) |
-| | Geopolitical | `S_strike` | Binary strike-event flag | [ABIN](https://www.gov.br/abin/pt-br) |
-| | | `S_strikeGT` | Topic: *greve* (strike) | [Google Trends](https://trends.google.com/) |
-| **Organism (O)** | Situational | `O_supermarketGT` | Topic: *supermercado* (supermarket) | [Google Trends](https://trends.google.com/) |
-| | | `O_minimarketGT` | Topic: *mercearia* (minimarket) | [Google Trends](https://trends.google.com/) |
-| | | `O_rationingGT` | Topic: *racionamento* (rationing) | [Google Trends](https://trends.google.com/) |
-| | | `O_fearGT` | Topic: *medo* (fear) | [Google Trends](https://trends.google.com/) |
-| | Social | `O_newsCount` | Daily count of news headlines reporting shortages, restrictions, or panic buying in supermarkets | [G1 (Grupo Globo)](https://g1.globo.com) |
-| | | `O_mobilDist_X`, distance band X ∈ {0, 0–10 km, 10–100 km, 100 km+} | Daily distribution of population movement away from the home area, disaggregated by distance band | [Meta Data for Good](https://data.humdata.org/dataset/movement-distribution) |
-| | Institutional | `O_govPolicyGT` | PCA index of topics: *decreto* (decree), *estado de emergência* (state of emergency), *confinamento* (lockdown), *quarentena* (quarantine) | [Google Trends](https://trends.google.com/) |
-| | Economic | `O_inflationGT` | Topic: *inflação* (inflation) | [Google Trends](https://trends.google.com/) |
-| | | `O_basicFoodBasketGT` | Topic: *cesta básica* (basic food basket) | [Google Trends](https://trends.google.com/) |
-| **Response (R)** | Panic Buying | Daily supermarket sales revenue | Total daily municipal sales value of fiscal receipts issued by hypermarkets, supermarkets, and minimarkets | **SEF/SC** — by request (proprietary) |
- 
+
+<table>
+  <thead>
+    <tr>
+      <th>S-O-R</th>
+      <th>Domain</th>
+      <th>Variable</th>
+      <th>Description / search topics</th>
+      <th>Source</th>
+    </tr>
+  </thead>
+  <tbody>
+    <!-- STIMULUS SECTION (10 ROWS) -->
+    <tr>
+      <td rowspan="10"><b>Stimulus (S)</b></td>
+      <td rowspan="4">Environmental</td>
+      <td><code>S_precipAcc</code></td>
+      <td>3-day accumulated precipitation</td>
+      <td><a href="https://bdmep.inmet.gov.br/">INMET / BDMEP</a></td>
+    </tr>
+    <tr>
+      <td><code>S_windGustMax</code></td>
+      <td>Daily maximum wind gust</td>
+      <td><a href="https://bdmep.inmet.gov.br/">INMET / BDMEP</a></td>
+    </tr>
+    <tr>
+      <td><code>S_climateGT</code></td>
+      <td>PCA index of topics: <i>previsão do tempo</i> (weather forecast), <i>defesa civil</i> (civil defense), <i>chuva</i> (rain), <i>inundação</i> (flood)</td>
+      <td><a href="https://trends.google.com/">Google Trends</a></td>
+    </tr>
+    <tr>
+      <td><code>S_cycloneGT</code></td>
+      <td>Topic: <i>ciclone</i> (cyclone)</td>
+      <td><a href="https://trends.google.com/">Google Trends</a></td>
+    </tr>
+    <tr>
+      <td rowspan="4">Health</td>
+      <td><code>S_pandemicCumulCasesLog</code></td>
+      <td>Cumulative COVID-19 confirmed cases (log)</td>
+      <td><a href="https://brasil.io/dataset/covid19/caso_full/">Brasil.IO</a></td>
+    </tr>
+    <tr>
+      <td><code>S_pandemicCumulDeathsLog</code></td>
+      <td>Cumulative COVID-19 confirmed deaths (log)</td>
+      <td><a href="https://brasil.io/dataset/covid19/caso_full/">Brasil.IO</a></td>
+    </tr>
+    <tr>
+      <td><code>S_pandemicGT</code></td>
+      <td>Topic: <i>pandemia</i> (pandemic)</td>
+      <td><a href="https://trends.google.com/">Google Trends</a></td>
+    </tr>
+    <tr>
+      <td><code>S_healthGT</code></td>
+      <td>Topic: <i>saúde</i> (health)</td>
+      <td><a href="https://trends.google.com/">Google Trends</a></td>
+    </tr>
+    <tr>
+      <td rowspan="2">Geopolitical</td>
+      <td><code>S_strike</code></td>
+      <td>Binary strike-event flag</td>
+      <td><a href="https://www.gov.br/abin/pt-br">ABIN</a></td>
+    </tr>
+    <tr>
+      <td><code>S_strikeGT</code></td>
+      <td>Topic: <i>greve</i> (strike)</td>
+      <td><a href="https://trends.google.com/">Google Trends</a></td>
+    </tr>
+    <!-- ORGANISM SECTION (9 ROWS) -->
+    <tr>
+      <td rowspan="9"><b>Organism (O)</b></td>
+      <td rowspan="4">Situational</td>
+      <td><code>O_supermarketGT</code></td>
+      <td>Topic: <i>supermercado</i> (supermarket)</td>
+      <td><a href="https://trends.google.com/">Google Trends</a></td>
+    </tr>
+    <tr>
+      <td><code>O_minimarketGT</code></td>
+      <td>Topic: <i>mercearia</i> (minimarket)</td>
+      <td><a href="https://trends.google.com/">Google Trends</a></td>
+    </tr>
+    <tr>
+      <td><code>O_rationingGT</code></td>
+      <td>Topic: <i>racionamento</i> (rationing)</td>
+      <td><a href="https://trends.google.com/">Google Trends</a></td>
+    </tr>
+    <tr>
+      <td><code>O_fearGT</code></td>
+      <td>Topic: <i>medo</i> (fear)</td>
+      <td><a href="https://trends.google.com/">Google Trends</a></td>
+    </tr>
+    <tr>
+      <td rowspan="2">Social</td>
+      <td><code>O_newsCount</code></td>
+      <td>Daily count of news headlines reporting shortages...</td>
+      <td><a href="https://g1.globo.com">G1 (Grupo Globo)</a></td>
+    </tr>
+    <tr>
+      <td><code>O_mobilDist_X</code></td>
+      <td>Daily distribution of population movement...</td>
+      <td><a href="https://data.humdata.org/dataset/movement-distribution">Meta Data</a></td>
+    </tr>
+    <tr>
+      <td>Institutional</td>
+      <td><code>O_govPolicyGT</code></td>
+      <td>PCA index of topics: <i>decreto</i>, <i>quarentena</i>...</td>
+      <td><a href="https://trends.google.com/">Google Trends</a></td>
+    </tr>
+    <tr>
+      <td rowspan="2">Economic</td>
+      <td><code>O_inflationGT</code></td>
+      <td>Topic: <i>inflação</i> (inflation)</td>
+      <td><a href="https://trends.google.com/">Google Trends</a></td>
+    </tr>
+    <tr>
+      <td><code>O_basicFoodBasketGT</code></td>
+      <td>Topic: <i>cesta básica</i> (basic food basket)</td>
+      <td><a href="https://trends.google.com/">Google Trends</a></td>
+    </tr>
+    <!-- RESPONSE SECTION -->
+    <tr>
+      <td><b>Response (R)</b></td>
+      <td>Panic Buying</td>
+      <td>Daily supermarket sales revenue</td>
+      <td>Total daily municipal sales value of fiscal receipts...</td>
+      <td><b>SEF/SC</b> (Proprietary)</td>
+    </tr>
+  </tbody>
+</table>
+
 *The dictionary uses the manuscript's canonical variable names; raw column names in the processed CSV may carry minor spelling variants (e.g., `S_climate_Gtrends`). The IPCA food-at-home index used to deflate the Response is documented separately under Externally retrieved open data below.*
  
 ### ✅ Committed open data (`data/`)
