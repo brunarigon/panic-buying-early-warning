@@ -117,37 +117,53 @@ The remainder of this README moves from high-level structure to technical detail
 ---
 
 ## 💾 Data requirements
-
+ 
 Running the full pipeline requires two categories of input data: a **proprietary fiscal panel** (not shared) and **open external data** (either committed here or freely retrievable).
-
+ 
 ### ⛔ Proprietary source data (`data/input/` — ignored by git)
-
+ 
 The behavioral **Response** variable is built from **daily aggregate supermarket sales revenue**, derived from electronic fiscal-receipt (*Nota Fiscal de Consumidor Eletrônica*) records provided by the **Santa Catarina State Treasury (Secretaria de Estado da Fazenda de Santa Catarina, SEF/SC)**.
-
+ 
 > **This data is not redistributed in this repository, in compliance with the Santa Catarina State Treasury's data-protection guidelines.** Everything that depends on it lives under `data/input/`, which is listed in `.gitignore`. Requests for access should be directed to the Santa Catarina State Treasury.
-
+ 
 The fiscal series is merged with the open external signals into a set of progressively enriched daily city-panel files (all under `data/input/`). The one required to reproduce the modelling results is:
-
+ 
 | File | Role |
 | --- | --- |
 | `3_Final_data_With_Time_modification_ADDED_Var.csv` | **The processed modelling panel.** Long-format daily city panel used by every analysis after Section 1 (temporal CV, classification, SHAP, Local Projections, episode anatomy). |
 | `2_5_Final_data_Before_Time_modification_and_new_variables.xlsx` | Pre-time-transformation merged panel (entry point for a full re-run from Section 0). |
 | `Final_data_With_API.rds` | Cached panel after IPCA-deflator retrieval and per-capita normalization. |
 | *(other `2_…` / `3_…` intermediates)* | Sequential build stages written by the pipeline. |
-
-**Schema of the merged panel.** The panel is keyed by `city` × `date` (15 municipalities × daily, 2018–2025 ≈ 43,800 city-day rows) and organizes predictors by S-O-R domain (prefixes `S_` = Stimulus, `O_` = Organism):
-
-| Component | Representative fields | Source |
-| --- | --- | --- |
-| **Response** | `total_sales_value_daily`, `valor_pc` (per-capita), `population_2022`, invoice counts | SEF/SC fiscal receipts (proprietary) |
-| **S — Environmental** | `S_precip_daily`, `S_precip_acc_3d`, `S_wind_gust_max`, `S_climate_Gtrends`, `S_cyclone_Gtrends`, `S_weatherGT` | INMET meteorological stations; Google Trends |
-| **S — Health** | `S_pandemic_cumulcases_log`, `S_pandemic_cumuldeaths_log`, `S_pandemic_severity_index`, `S_pandemic_Gtrends`, `S_health_Gtrends` | SES/SC epidemiological records; Google Trends |
-| **S — Geopolitical** | `S_strike_event`, `S_strike_Gtrends` | Documented event calendar; Google Trends |
-| **O — Situational** | `O_supermarket_Gtrends`, `O_minimarket_Gtrends`, `O_rationing_Gtrends`, `O_basicfoodbasket_Gtrends` | Google Trends |
-| **O — Social** | `O_news_count`, `O_mobil_dist_0`, `O_mobil_dist_0_10km`, `O_mobil_dist_10_100km`, `O_mobil_dist_100km_plus` | G1 (Grupo Globo) news headlines; Meta Movement Distribution Maps |
-| **O — Institutional** | `O_gov_policy_Gtrends` | Google Trends |
-| **O — Economic** | `O_inflation_Gtrends`, `O_basicFoodBasketGT` | Google Trends; IPCA food-at-home sub-index (IBGE/SIDRA) |
-
+ 
+**Schema of the merged panel.** The panel is keyed by `city` × `date` (15 municipalities × daily, 2018–2025 ≈ 43,800 city-day rows). The **Response** is built from the proprietary fiscal series (`total_sales_value_daily`, normalized per capita by `population_2022`), while the predictors operationalize the seven S-O-R domains (prefixes `S_` = Stimulus, `O_` = Organism).
+ 
+**Variable dictionary (S-O-R operationalization).** The table below documents every variable, its search topic or definition, and its data source. It corresponds to the full variable list in Appendix A.2 of the manuscript. Google Trends topics are given in Brazilian Portuguese (English gloss in parentheses); PCA-aggregated indices bundle several correlated search topics into a single component.
+ 
+| S-O-R | Domain | Variable | Description / search topics | Source |
+| --- | --- | --- | --- | --- |
+| **Stimulus (S)** | Environmental | `S_precipAcc` | 3-day accumulated precipitation | [INMET / BDMEP](https://bdmep.inmet.gov.br/) |
+| | | `S_windGustMax` | Daily maximum wind gust | [INMET / BDMEP](https://bdmep.inmet.gov.br/) |
+| | | `S_climateGT` | PCA index of topics: *previsão do tempo* (weather forecast), *defesa civil* (civil defense), *chuva* (rain), *inundação* (flood) | [Google Trends](https://trends.google.com/) |
+| | | `S_cycloneGT` | Topic: *ciclone* (cyclone) | [Google Trends](https://trends.google.com/) |
+| | Health | `S_pandemicCumulCasesLog` | Cumulative COVID-19 confirmed cases (log) | [Brasil.IO](https://brasil.io/dataset/covid19/caso_full/) |
+| | | `S_pandemicCumulDeathsLog` | Cumulative COVID-19 confirmed deaths (log) | [Brasil.IO](https://brasil.io/dataset/covid19/caso_full/) |
+| | | `S_pandemicGT` | Topic: *pandemia* (pandemic) | [Google Trends](https://trends.google.com/) |
+| | | `S_healthGT` | Topic: *saúde* (health) | [Google Trends](https://trends.google.com/) |
+| | Geopolitical | `S_strike` | Binary strike-event flag | [ABIN](https://www.gov.br/abin/pt-br) |
+| | | `S_strikeGT` | Topic: *greve* (strike) | [Google Trends](https://trends.google.com/) |
+| **Organism (O)** | Situational | `O_supermarketGT` | Topic: *supermercado* (supermarket) | [Google Trends](https://trends.google.com/) |
+| | | `O_minimarketGT` | Topic: *mercearia* (minimarket) | [Google Trends](https://trends.google.com/) |
+| | | `O_rationingGT` | Topic: *racionamento* (rationing) | [Google Trends](https://trends.google.com/) |
+| | | `O_fearGT` | Topic: *medo* (fear) | [Google Trends](https://trends.google.com/) |
+| | Social | `O_newsCount` | Daily count of news headlines reporting shortages, restrictions, or panic buying in supermarkets | [G1 (Grupo Globo)](https://g1.globo.com) |
+| | | `O_mobilDist_X`, distance band X ∈ {0, 0–10 km, 10–100 km, 100 km+} | Daily distribution of population movement away from the home area, disaggregated by distance band | [Meta Data for Good](https://data.humdata.org/dataset/movement-distribution) |
+| | Institutional | `O_govPolicyGT` | PCA index of topics: *decreto* (decree), *estado de emergência* (state of emergency), *confinamento* (lockdown), *quarentena* (quarantine) | [Google Trends](https://trends.google.com/) |
+| | Economic | `O_inflationGT` | Topic: *inflação* (inflation) | [Google Trends](https://trends.google.com/) |
+| | | `O_basicFoodBasketGT` | Topic: *cesta básica* (basic food basket) | [Google Trends](https://trends.google.com/) |
+| **Response (R)** | Panic Buying | Daily supermarket sales revenue | Total daily municipal sales value of fiscal receipts issued by hypermarkets, supermarkets, and minimarkets | **SEF/SC** — by request (proprietary) |
+ 
+*The dictionary uses the manuscript's canonical variable names; raw column names in the processed CSV may carry minor spelling variants (e.g., `S_climate_Gtrends`). The IPCA food-at-home index used to deflate the Response is documented separately under Externally retrieved open data below.*
+ 
 ### ✅ Committed open data (`data/`)
 
 These small, publicly sourced files are included so the health-domain steps run out of the box:
