@@ -4,7 +4,7 @@ This repository contains the full implementation (R pipeline, Python data-collec
 
 The code and supporting files reproduce every calculation, table, and figure in the paper. For a user-friendly, end-to-end walkthrough of the pipeline and the main estimations, see the compiled reproducibility notebook:
 
-➡️ **[Reproducibility notebook (HTML)](https://brunarigon.github.io/panic-buying-early-warning/)** — also available as [`index.html`](index.html) / [`index.Rmd`](index.Rmd) in this repository.
+➡️ **[Reproducibility notebook (HTML)](https://panic-buying-ews.netlify.app/)** — also available as [`index.html`](index.html) / [`index.Rmd`](index.Rmd) in this repository.
 
 > **Peer-review note.** This repository is provided for review. Author, affiliation, and acknowledgement information has been intentionally omitted from all documentation for anonymity.
 
